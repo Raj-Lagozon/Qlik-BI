@@ -1,0 +1,6 @@
+requests>=2.31
+websocket-client>=1.7
+python-dotenv>=1.0
+openai>=1.50
+pydantic>=2
+pbip-compiler>=0.2.0

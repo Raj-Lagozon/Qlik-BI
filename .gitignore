@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Pipeline outputs (real Qlik/Power BI data — never commit)
+extracted/*
+!extracted/.gitkeep
+converted/*
+!converted/.gitkeep
+output/*
+!output/.gitkeep
+*.qvf
+*.pbix
+*.pbip
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
