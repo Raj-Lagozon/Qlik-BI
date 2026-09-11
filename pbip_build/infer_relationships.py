@@ -88,12 +88,20 @@ def infer_relationships(tables: dict[str, dict], extracted_dir: str) -> list[dic
             seen_pairs.add(pair_key)
             real_field_many = _real_field_name(tables, t, field_cf)
             real_field_one = _real_field_name(tables, one_side[0], field_cf)
+            # Only call it one-to-one when the "many" side's key is
+            # *fully* unique too (not merely mostly-unique): a 1:1
+            # cardinality that a later, larger refresh violates makes
+            # Power BI reject the refresh outright, so it must be a
+            # near-certainty, not a guess off a small sample. When it is
+            # genuinely 1:1, RELATED() works in both directions, which is
+            # what lets a measure iterate either table.
+            one_to_one = ratio >= 0.999 and one_side[3] >= 0.999
             relationships.append({
                 "from_table": t,
                 "from_column": real_field_many,
                 "to_table": one_side[0],
                 "to_column": real_field_one,
-                "cardinality": "one-to-one" if ratio >= MIN_UNIQUE_RATIO else "one-to-many",
+                "cardinality": "one-to-one" if one_to_one else "one-to-many",
                 "cross_filter": "single",
             })
 

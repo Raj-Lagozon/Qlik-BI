@@ -9,6 +9,23 @@ from pbip_compiler.models import Relationship
 from pbip_compiler.semantic_model import tmdl as _tmdl_module
 
 
+_QUALIFIED_COL_RE = re.compile(r"^\s*(?:'([^']+)'|([^.]+))\.(.+?)\s*$")
+
+
+def _split_table_column(value: str) -> tuple[str, str] | None:
+    """Parse a TMDL qualified column reference — 'Table.Column', or
+    ''Table Name'.Column' when the table isn't a bare identifier (spaces,
+    '%', etc.) — the single format real TMDL uses for a relationship's
+    fromColumn/toColumn (confirmed against a real Desktop-authored
+    relationships.tmdl). semantic_model.py's _tmdl_qualify is what writes
+    this format; this is its inverse."""
+    m = _QUALIFIED_COL_RE.match(value)
+    if not m:
+        return None
+    table = m.group(1) if m.group(1) is not None else m.group(2)
+    return table.strip(), m.group(3).strip()
+
+
 def _patched_parse_relationships(self, text: str) -> list[Relationship]:
     """Replaces pbip_compiler.semantic_model.tmdl.TmdlParser._parse_relationships.
 
@@ -22,16 +39,27 @@ def _patched_parse_relationships(self, text: str) -> list[Relationship]:
     toTable/toColumn in that merged blob, so every relationship after the
     first one in a file is silently dropped. Splitting on the header line
     itself keeps each block isolated regardless of blank-line spacing.
+
+    Also parses the real TMDL relationship format — a single
+    'fromColumn: Table.Column' / 'toColumn: Table.Column' pair, not
+    separate fromTable/fromColumn/toTable/toColumn properties (the old
+    separate-property form this function used to look for isn't valid TMDL
+    at all — Desktop rejected it outright: "fromTable is not a supported
+    property in the current context").
     """
     out: list[Relationship] = []
     blocks = re.split(r"(?m)^relationship\s+\S+\s*$", text)
     for body in blocks[1:]:
-        from_t = re.search(r"fromTable:\s*(.+)", body)
-        from_c = re.search(r"fromColumn:\s*(.+)", body)
-        to_t = re.search(r"toTable:\s*(.+)", body)
-        to_c = re.search(r"toColumn:\s*(.+)", body)
-        if not (from_t and from_c and to_t and to_c):
+        from_m = re.search(r"(?m)^\s*fromColumn:\s*(.+)$", body)
+        to_m = re.search(r"(?m)^\s*toColumn:\s*(.+)$", body)
+        if not (from_m and to_m):
             continue
+        from_split = _split_table_column(from_m.group(1))
+        to_split = _split_table_column(to_m.group(1))
+        if not (from_split and to_split):
+            continue
+        from_table, from_column = from_split
+        to_table, to_column = to_split
         # pbip_compiler.models.Relationship has no is_active field at all —
         # its DataModel builder activates every relationship it's given,
         # unconditionally. An `isActive: false` line here is real and
@@ -48,10 +76,10 @@ def _patched_parse_relationships(self, text: str) -> list[Relationship]:
         if re.search(r"(?m)^\s*isActive:\s*false\s*$", body, re.IGNORECASE):
             continue
         out.append(Relationship(
-            from_table=from_t.group(1).strip().strip("'\""),
-            from_column=from_c.group(1).strip().strip("'\""),
-            to_table=to_t.group(1).strip().strip("'\""),
-            to_column=to_c.group(1).strip().strip("'\""),
+            from_table=from_table,
+            from_column=from_column,
+            to_table=to_table,
+            to_column=to_column,
         ))
     return out
 

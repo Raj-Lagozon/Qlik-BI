@@ -22,6 +22,20 @@ plausible. A renamed or invented field/table name breaks silently — the
 converted measure will look reasonable right up until Power BI can't find
 the field it references.
 
+**If a Qlik measure aggregates a bare field name that appears NOWHERE in
+the provided `data_model` (not a field on any table), do NOT invent a
+table for it** — and in particular never emit the `FieldName[FieldName]`
+shape (a fabricated table whose name equals the field's). That field is
+genuinely missing from the extracted model — the source Qlik measure is
+referencing data that wasn't loaded (an orphaned/broken master measure,
+which Qlik apps do carry). Emit the measure with `"expression"` set to a
+DAX comment naming the missing field, e.g.
+`"BLANK() // TODO: Qlik referenced field 'ExpediteCost' which is not in the model"`,
+`"confidence": "low"`, and the original Qlik expression quoted in
+`"notes"`, so a person can wire it up by hand if that data is available in
+Power BI. The measure must still exist (visuals bind to it by name) — it
+just can't have a real formula.
+
 **A reference to another measure is NEVER table-qualified — this is a
 different rule from column qualification, and confusing the two is a
 serious, common mistake.** A real *column* is written `Table[Column]`. A
@@ -37,6 +51,36 @@ matching the exact "measure name used as a column name" failure this
 mistake produces. When your expression needs to reference another measure
 by name (e.g. `[Achievement %]` inside a bigger formula), always emit it
 bare, regardless of which table logically "owns" that other measure.
+
+# Cross-table row-by-row calculations (SUMX + RELATED)
+
+A Qlik expression like `Sum( <per-row formula mixing fields from two
+associated tables> )` becomes `SUMX(<table>, <per-row formula>)` in DAX —
+but `<table>` and every field reference inside it must be chosen with the
+relationship direction in mind, or Power BI fails with *"the column
+'T[c]' either doesn't exist or doesn't have a relationship to any table
+available in the current context."*
+
+- **`RELATED(OtherTable[Col])` only traverses many → one.** It is valid
+  *only* when the table you're iterating with `SUMX`/`AVERAGEX`/etc. is on
+  the **many** side of a relationship to `OtherTable`, and `OtherTable` is
+  on the **one** side. Iterating the one side and calling `RELATED()`
+  toward the many side is the exact error above.
+- **Iterate the table on the many side** — the fact/detail table, the one
+  with more rows / the non-unique key. Its own columns are then referenced
+  directly (no `RELATED`), and only the *one-side* table's columns go
+  through `RELATED()`. Look at `data_model`: the table whose join key
+  repeats is the many side; the table whose key is unique is the one side.
+- **When the two tables share a key 1-to-1** (both keys unique — e.g. a
+  fact table and a per-row "prediction"/"enrichment" table keyed on the
+  same id), the relationship is one-to-one and `RELATED()` works in
+  *either* direction, so iterate whichever table owns most of the per-row
+  fields. If you cannot tell the direction from `data_model`, do **not**
+  guess: use `LOOKUPVALUE(OtherTable[Col], OtherTable[Key], ThisTable[Key])`
+  instead of `RELATED()` — it needs no relationship and is direction-
+  agnostic (note this choice in `"notes"` and drop confidence).
+- Never write `RELATED(SameTableYoureIterating[Col])` — reference that
+  table's own columns bare as `Table[Col]`.
 
 # Input you receive
 The full `measures` array from `measures.json` (`title`, `expression`,
