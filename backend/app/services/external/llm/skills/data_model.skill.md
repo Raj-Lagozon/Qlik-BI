@@ -72,9 +72,21 @@ don't carry a confidence field.
 - Fields used only as join keys should be flagged in `key_columns` so the
   builder can set `isKey: true` / hide the raw key column when a friendlier
   display column exists.
-- Cardinality: default `"one-to-many"` unless both sides have equally high
-  distinct-value ratios relative to row count, in which case use
-  `"one-to-one"`.
+- Cardinality: always `"one-to-many"` — never `"one-to-one"`, even when both
+  sides happen to have equally high distinct-value ratios. `from_table` is
+  the many/fact side, `to_table` is the one/dimension side (the builder
+  renders this as plain, un-asserted many-to-one TMDL either way — proper
+  star-schema shape). A genuinely 1:1-looking pair of tables is a sign they
+  could be merged, not a reason to declare the relationship 1:1: asserting
+  1:1 has repeatedly caused Power BI Desktop to reject the whole project on
+  open ("Relationship '<guid>' uses an invalid column ID <n>") with no
+  corresponding benefit — every real DAX use case (RELATED() reading a
+  dimension-side column while iterating the fact side) already works under
+  plain many-to-one, no 1:1 required. If two tables share a key and BOTH
+  look like fact tables (e.g. one invoice table, one payments-per-invoice
+  table), still pick whichever is the natural "many" side (the one that can
+  have multiple rows per key, even if today's sample happens not to) as
+  `from_table`.
 - Cross-filter direction: default `"single"` (dimension filters fact); only
   use `"both"` when the Qlik app's associative behavior clearly requires
   bidirectional filtering between two dimension-like tables (rare — flag with

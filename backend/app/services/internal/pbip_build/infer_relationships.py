@@ -88,20 +88,24 @@ def infer_relationships(tables: dict[str, dict], extracted_dir: str) -> list[dic
             seen_pairs.add(pair_key)
             real_field_many = _real_field_name(tables, t, field_cf)
             real_field_one = _real_field_name(tables, one_side[0], field_cf)
-            # Only call it one-to-one when the "many" side's key is
-            # *fully* unique too (not merely mostly-unique): a 1:1
-            # cardinality that a later, larger refresh violates makes
-            # Power BI reject the refresh outright, so it must be a
-            # near-certainty, not a guess off a small sample. When it is
-            # genuinely 1:1, RELATED() works in both directions, which is
-            # what lets a measure iterate either table.
-            one_to_one = ratio >= 0.999 and one_side[3] >= 0.999
+            # Always many-to-one (t = many/fact side, one_side = one/
+            # dimension side) — never one-to-one, even when the "many"
+            # side's key also happens to be fully unique. Proper star-schema
+            # modeling keeps a fact table (or a fact-like table related to
+            # another) on the many side of every relationship; a real 1:1
+            # is a sign two tables should be merged, not related, and
+            # semantic_model.py's TMDL writer no longer renders 1:1 +
+            # bothDirections at all regardless of what's put here (repeated,
+            # confirmed source of Power BI project-load failures with no
+            # corresponding benefit — every RELATED() call in practice
+            # already iterates the many side and reads the one side, which
+            # plain many-to-one supports natively).
             relationships.append({
                 "from_table": t,
                 "from_column": real_field_many,
                 "to_table": one_side[0],
                 "to_column": real_field_one,
-                "cardinality": "one-to-one" if one_to_one else "one-to-many",
+                "cardinality": "one-to-many",
                 "cross_filter": "single",
             })
 

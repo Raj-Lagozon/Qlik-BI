@@ -8,12 +8,13 @@ import json
 import os
 import re
 
+from app.config.settings import settings
+
 from .azure_client import run_skill
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SKILLS_DIR = os.path.join(ROOT, "skills")
-EXTRACTED_ROOT = os.path.join(ROOT, "extracted")
-CONVERTED_ROOT = os.path.join(ROOT, "converted")
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+EXTRACTED_ROOT = str(settings.project_root / "extracted")
+CONVERTED_ROOT = str(settings.project_root / "converted")
 
 
 def _load_skill(filename: str) -> str:
@@ -193,6 +194,19 @@ def _convert_parameters(app_name: str) -> str | None:
     return _write_converted(app_name, "variables.converted.json", result)
 
 
+# A sheet with a lot of objects (very common now that a Qlik "KPI
+# container" gets expanded into one discrete object per child tile —
+# 30-40+ objects on one sheet is normal) puts a payload in front of the LLM
+# that's too big for it to reliably enumerate: it silently converts only
+# the first handful of objects and drops the rest, with no error — a page
+# that should have ~40 real visuals comes back with 2. Splitting a large
+# sheet into several smaller calls (each getting the sheet's own metadata
+# but only a slice of its objects) and merging the results keeps every
+# individual call small enough to actually finish converting what it was
+# given.
+_MAX_OBJECTS_PER_REPORT_CALL = 12
+
+
 def _convert_report(app_name: str) -> list[str]:
     skill = _load_skill("report_visuals.skill.md")
     sheets = _load_extracted(app_name, "sheets.json")
@@ -201,11 +215,30 @@ def _convert_report(app_name: str) -> list[str]:
 
     paths = []
     for sheet in sheets:
-        payload = {"sheet": sheet, "measures": measures, "dimensions": dimensions}
         sheet_id = sheet.get("id") or _safe(sheet.get("title", "sheet"))
-        print(f"[convert] sheet '{sheet.get('title', sheet_id)}' (sheets.json) -> report_visuals.skill.md")
-        result = run_skill(skill, payload, json_output=True)
-        _collect_confidence("report_visuals", result.get("visuals", []))
+        title = sheet.get("title", sheet_id)
+        objects = sheet.get("objects", [])
+        if len(objects) > _MAX_OBJECTS_PER_REPORT_CALL:
+            batches = [objects[i:i + _MAX_OBJECTS_PER_REPORT_CALL]
+                       for i in range(0, len(objects), _MAX_OBJECTS_PER_REPORT_CALL)]
+            print(f"[convert] sheet '{title}' has {len(objects)} objects — splitting into {len(batches)} "
+                  f"batches of <= {_MAX_OBJECTS_PER_REPORT_CALL} so the LLM can't silently truncate/drop "
+                  f"objects on one oversized call")
+        else:
+            batches = [objects]
+
+        merged_page, merged_visuals = None, []
+        for i, batch in enumerate(batches):
+            payload = {"sheet": {**sheet, "objects": batch}, "measures": measures, "dimensions": dimensions}
+            label = f"sheet '{title}'" + (f" (batch {i + 1}/{len(batches)})" if len(batches) > 1 else "")
+            print(f"[convert] {label} (sheets.json) -> report_visuals.skill.md")
+            result = run_skill(skill, payload, json_output=True)
+            if merged_page is None:
+                merged_page = result.get("page", {})
+            merged_visuals.extend(result.get("visuals", []))
+
+        result = {"page": merged_page or {}, "visuals": merged_visuals}
+        _collect_confidence("report_visuals", result["visuals"])
         paths.append(_write_converted(app_name, f"page__{_safe(sheet_id)}.json", result))
     return paths
 

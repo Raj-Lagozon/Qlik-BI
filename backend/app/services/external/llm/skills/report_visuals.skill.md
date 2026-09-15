@@ -101,6 +101,22 @@ dimensions/measures bound to it — a pure decorative/config extension), emit
 a `textbox` visual containing a note of the original object's title and
 type instead of dropping it silently.
 
+A `textbox`'s text is a `general` object's `properties.paragraphs`, never a
+top-level `objects.paragraphs` and never a bare `{"text": "..."}`:
+```json
+"visual": {
+  "visualType": "textbox",
+  "objects": {
+    "general": [
+      {"properties": {"paragraphs": [{"textRuns": [{"value": "<the text>"}]}]}}
+    ]
+  }
+}
+```
+`objects.paragraphs` directly (skipping `general`/`properties`) is invalid
+PBIR — Power BI rejects the whole report ("Required property 'properties'
+was not included" / "An additional property 'text' was included").
+
 If an unrecognized `type` string DOES carry a real `qHyperCubeDef` with
 dimensions/measures (a third-party or custom-branded chart extension built
 on standard Qlik data binding, just not one of the types in the table
@@ -157,6 +173,54 @@ When in doubt for a visual type not listed here, match whichever of
 - A hierarchy hop (drill-down dimension used on an axis) → project the
   hierarchy's top level column first; Power BI expands remaining levels at
   render/drill time, it does not need every level projected up front.
+
+**`Property` is always a SIBLING of `Expression`, never nested inside it.**
+This has been the single most common shape mistake — putting `Property`
+next to `SourceRef` *inside* `Expression` instead of next to `Expression`
+itself silently makes the whole field unresolvable (every reader, including
+Power BI itself, looks for `Property` at the sibling position and finds
+nothing there):
+```json
+// WRONG — Property nested inside Expression
+{"field": {"Column": {"Expression": {"SourceRef": {"Entity": "<Table>"}, "Property": "<Field>"}}}}
+// RIGHT — Property is a sibling of Expression
+{"field": {"Column": {"Expression": {"SourceRef": {"Entity": "<Table>"}}, "Property": "<Field>"}}}
+```
+
+## Aggregating a raw field (count-distinct of a column, etc.)
+When a projection needs an aggregate applied to a plain column that isn't
+already a measure (e.g. "count distinct of InvoiceID" typed straight into a
+KPI, not backed by a master measure), wrap the `Column` in a real PBIR
+`Aggregation` node with an integer `Function` code — **never** add a
+made-up sibling property like `"aggregate"`/`"aggregation"` next to
+`field`. PBIR's schema has no such property anywhere on a projection; it
+gets rejected outright ("An additional property '...' was included").
+```json
+{
+  "field": {
+    "Aggregation": {
+      "Expression": {"Column": {"Expression": {"SourceRef": {"Entity": "<Table>"}}, "Property": "<Field>"}},
+      "Function": 2
+    }
+  },
+  "queryRef": "<Table>.<Field>"
+}
+```
+`Function` codes: `0`=Sum, `1`=Average, `2`=DistinctCount, `3`=Min, `4`=Max,
+`5`=Count, `6`=Median, `7`=StandardDeviation, `8`=Variance.
+
+## A KPI whose expression is a hard-coded constant (e.g. `=Sum(5)`)
+This is a common Qlik idiom for a static target/placeholder tile — it isn't
+a real aggregation over any field or measure. Do **not** invent a
+fabricated table name (seen in practice: `"MeasureTable"`) to bind it to —
+that table doesn't exist anywhere in the model and Power BI reports
+"Fields that need to be fixed." Instead:
+- Bind it as a normal `Measure` projection using the placeholder name as
+  both `Entity` and `Property` is fine (a later deterministic build step
+  recovers the real value and creates it as an actual measure) — but the
+  numeric value MUST be recoverable from `"notes"` in one of these exact
+  phrasings so that step can parse it: `"Placeholder measure '<Name>'
+  (value=<N>)"` or `"...=Sum(<N>)..."`. Always include the literal number.
 
 # KPI-specific rules
 Qlik `kpi` objects usually carry one measure expression plus a label and a

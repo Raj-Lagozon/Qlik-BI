@@ -88,6 +88,12 @@ def _strip_redundant_name_prefix(name: str, expr: str | None) -> str | None:
 DATA_TYPE_MAP = {
     "int64": "int64", "double": "double", "string": "string",
     "dateTime": "dateTime", "boolean": "boolean", "decimal": "double",
+    # A column whose real content can be either a number or text depending
+    # on the source file (see project.py / csv_m.py's month-column
+    # handling) — the one Tabular column type built for exactly that: it
+    # stores whatever native type each value actually is instead of forcing
+    # one.
+    "variant": "variant",
 }
 
 
@@ -157,8 +163,9 @@ def write_semantic_model(
     else:
         _remove_if_exists(os.path.join(defn_dir, "expressions.tmdl"))
 
+    calculated_tables = {name for name, t in tables.items() if t.get("is_calculated")}
     with open(os.path.join(defn_dir, "relationships.tmdl"), "w", encoding="utf-8") as f:
-        f.write(_render_relationships_tmdl(relationships))
+        f.write(_render_relationships_tmdl(relationships, calculated_tables))
 
     with open(os.path.join(defn_dir, "model.tmdl"), "w", encoding="utf-8") as f:
         f.write(_render_model_tmdl())
@@ -184,6 +191,19 @@ def _q(name: str) -> str:
     `measure ''FILTERS''` is a parse error ("single-quote character in name
     must be escaped")."""
     return "'" + str(name).replace("'", "''") + "'"
+
+
+def _q_value(value: str) -> str:
+    """A double-quoted TMDL string PROPERTY VALUE (formatString:, etc.) with
+    any embedded double quote doubled ("" — the TMDL escape for this quote
+    style, distinct from _q()'s single-quote escape for object NAMES). A
+    Power BI custom number format legitimately embeds literal double-quoted
+    text of its own (e.g. `"$"#,##0.00,,"M"` for a "$1.2M" style display) —
+    writing that raw as `formatString: "$"#,##0.00,,"M"` reads as a string
+    that closes after `"$"` and then has stray unescaped quotes, which
+    Power BI's TMDL parser rejects outright ("expected to be an escaped
+    string ... un-escaped quote marker")."""
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def _render_table_tmdl(
@@ -239,20 +259,40 @@ def _render_table_tmdl(
         # deeper than the "measure 'X' =" declaration line itself (1).
         lines.extend(_render_multiline_stmt(f"\tmeasure {_q(m['name'])} = ", expr, cont_tabs=3))
         if m.get("format_string"):
-            lines.append(f"\t\tformatString: {m['format_string']}")
+            lines.append(f"\t\tformatString: {_q_value(m['format_string'])}")
         if m.get("is_hidden"):
             lines.append("\t\tisHidden")
         lines.append(f"\t\tlineageTag: {_guid()}")
         lines.append("")
 
-    for h in hierarchies:
-        lines.append(f"\thierarchy {_q(h['name'])}")
-        lines.append(f"\t\tlineageTag: {_guid()}")
-        lines.append("")
-        for level in h.get("levels", []):
-            lines.append(f"\t\tlevel {_q(level['name'])}")
-            lines.append(f"\t\t\tcolumn: {level['column']}")
+    # A hierarchy level's `column:` property pointing at a DAX calculated
+    # table's own column fails Power BI Desktop's static, pre-refresh
+    # project-load validation exactly the same way a relationship into a
+    # calculated table does ("Level '<name>' in hierarchy '<name>' ... has
+    # the Column property set to an invalid column ID <n>") — same root
+    # cause as project.py's relationship handling: a calculated table's
+    # columns don't exist as something the static validator can confirm
+    # until the table's own DAX has actually evaluated. Applies regardless
+    # of which app/table — MasterCalendar (or any other auto-detected
+    # calendar table) commonly gets a drill-down hierarchy from the
+    # dimensions conversion, which has no way to know at conversion time
+    # that this particular table will end up calculated.
+    if hierarchies and is_calculated:
+        print(f"[build] NOTE: not declaring hierarch{'y' if len(hierarchies) == 1 else 'ies'} "
+              f"{', '.join(_q(h['name']) for h in hierarchies)} on calculated table {_q(name)} — Power BI "
+              f"Desktop's static project-load validation can't resolve a hierarchy level pointing at a "
+              f"calculated table's own column ('has the Column property set to an invalid column ID'). "
+              f"Add the drill-down hierarchy by hand in Model view after opening the .pbip, once the "
+              f"table's columns actually exist.")
+    elif hierarchies:
+        for h in hierarchies:
+            lines.append(f"\thierarchy {_q(h['name'])}")
+            lines.append(f"\t\tlineageTag: {_guid()}")
             lines.append("")
+            for level in h.get("levels", []):
+                lines.append(f"\t\tlevel {_q(level['name'])}")
+                lines.append(f"\t\t\tcolumn: {level['column']}")
+                lines.append("")
 
     if is_calculated and dax_expression:
         # A DAX calculated table (created "from the Power BI frontend", the
@@ -356,29 +396,46 @@ def _tmdl_qualify(table: str, column: str) -> str:
     return f"'{table}'.{column}"
 
 
-def _render_relationships_tmdl(relationships: list[dict]) -> str:
+def _render_relationships_tmdl(relationships: list[dict], calculated_tables: set[str] | None = None) -> str:
+    """Every relationship renders as a plain, un-asserted relationship —
+    TMDL's own default is many (fromColumn's table) to one (toColumn's
+    table), which is exactly correct star-schema shape as long as
+    from_table/to_table are assigned with the fact/many side as `from` and
+    the dimension/lookup side as `to` (both infer_relationships.py and the
+    data_model.skill.md conversion already follow that convention).
+
+    This deliberately NEVER asserts one-to-one + bothDirections, even when
+    a relationship's source data happens to be unique on both sides.
+    Reasons, all confirmed hands-on in this project rather than theoretical:
+      - It's bad star-schema modeling regardless of Power BI mechanics — a
+        fact table related to anything (another fact table included) should
+        be the many side; genuinely 1:1 tables are usually a sign they
+        should be merged, not related.
+      - No real measure in this pipeline has ever needed the "reverse"
+        RELATED() direction 1:1 exists to enable — every RELATED() call
+        found in practice iterates the many side and reads the one side,
+        which plain many-to-one already supports with no cardinality
+        assertion needed.
+      - A statically-asserted 1:1 relationship into/out of a DAX calculated
+        table fails Power BI Desktop's static project-load validation
+        outright ("Relationship '<guid>' uses an invalid column ID <n>"),
+        regardless of crossFilteringBehavior — this happened with two
+        unrelated calculated tables (one using RELATED() in its own
+        expression, one a plain CALENDARAUTO()), so it isn't a narrow edge
+        case.
+      - Since .qvf row/record data is no longer extracted (only structure),
+        there's no real data left to verify a "the source proves this is
+        truly 1:1" claim against anyway — asserting it is just trusting an
+        LLM guess that has repeatedly turned out to be more trouble than
+        it's worth.
+    `calculated_tables` is accepted for backward compatibility with callers
+    but no longer changes behavior (nothing here still branches on it).
+    """
     out = []
     for rel in relationships:
         out.append(f"relationship {_guid()}")
         out.append(f"\tfromColumn: {_tmdl_qualify(rel['from_table'], rel['from_column'])}")
         out.append(f"\ttoColumn: {_tmdl_qualify(rel['to_table'], rel['to_column'])}")
-        # A relationship omitting cardinality defaults to many-to-one
-        # (fromCardinality: many, toCardinality: one). When infer_relationships
-        # found the "from" side's key ALSO fully unique it's really 1:1 —
-        # mark it so, because RELATED() then traverses in BOTH directions: a
-        # measure that iterates the "to" table with SUMX and pulls a "from"
-        # table column via RELATED() (which would be an invalid one->many
-        # hop under the default cardinality — "column ... doesn't have a
-        # relationship to any table available in the current context")
-        # works once the relationship is genuinely one-to-one.
-        if rel.get("cardinality") == "one-to-one":
-            out.append("\tfromCardinality: one")
-            out.append("\ttoCardinality: one")
-            # Power BI requires a one-to-one relationship to filter both
-            # ways ("CrossFilterDirection for One-to-One relationships
-            # should always be set to BothDirections") — it rejects the
-            # project outright otherwise.
-            out.append("\tcrossFilteringBehavior: bothDirections")
         if rel.get("is_active") is False:
             out.append("\tisActive: false")
         out.append("")

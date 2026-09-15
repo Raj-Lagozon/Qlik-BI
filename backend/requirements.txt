@@ -1,0 +1,13 @@
+# Web API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pydantic-settings>=2.4
+
+# Pipeline (extract / convert / build) - same deps cli.py needs
+requests>=2.31
+websocket-client>=1.7
+python-dotenv>=1.0
+openai>=1.50
+pydantic>=2
+pbip-compiler>=0.2.0

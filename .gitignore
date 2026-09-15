@@ -16,6 +16,8 @@ converted/*
 !converted/.gitkeep
 output/*
 !output/.gitkeep
+backend/uploads/*
+!backend/uploads/.gitkeep
 *.qvf
 *.pbix
 *.pbip

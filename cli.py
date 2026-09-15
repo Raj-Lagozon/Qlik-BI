@@ -12,10 +12,16 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# The pipeline packages now live under backend/app/services/* (a proper
+# app/api/services/utils/config layout shared with the FastAPI web API in
+# backend/) rather than as top-level packages next to this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
 # Windows consoles default to cp1252; the pbip-compiler dependency prints
 # unicode arrows/emoji, so force UTF-8 stdout/stderr to avoid crashing on them.
@@ -53,23 +59,23 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "extract":
-        from qlik_extract import extract_app
+        from app.services.external.qlik import extract_app
         extract_app(args.qvf_path, args.name, args.space_id, args.keep_app)
 
     elif args.command == "convert":
-        from llm_convert import convert_app
+        from app.services.external.llm import convert_app
         written = convert_app(args.app_name)
         print(f"[convert] wrote {sum(len(v) if isinstance(v, list) else 1 for v in written.values())} artifact(s)")
 
     elif args.command == "build":
-        from pbip_build import build_project
+        from app.services.internal.pbip_build import build_project
         pbix_path = build_project(args.app_name)
         print(f"[build] .pbix ready: {pbix_path}")
 
     elif args.command == "run-all":
-        from qlik_extract import extract_app
-        from llm_convert import convert_app
-        from pbip_build import build_project
+        from app.services.external.qlik import extract_app
+        from app.services.external.llm import convert_app
+        from app.services.internal.pbip_build import build_project
 
         app_name = extract_app(args.qvf_path, args.name, args.space_id, args.keep_app)
         convert_app(app_name)

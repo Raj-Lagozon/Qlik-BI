@@ -8,20 +8,29 @@ sheets/visuals and Section Access all get carried over.
 
 ```
 .qvf file
-   │  qlik_extract  (Qlik Cloud REST import + Engine API / WebSocket JSON-RPC)
+   │  qlik client + extractor  (Qlik Cloud REST import + Engine API / WebSocket JSON-RPC)
+   │  backend/app/services/external/qlik/
    ▼
 extracted/<app>/  { script.qvs, data_model.json, measures.json, dimensions.json,
                      variables.json, sheets.json, section_access.json,
                      data/<table>.csv  <- real exported rows, one CSV per table }
-   │  llm_convert  (Azure OpenAI, one call per skills/*.skill.md)
+   │  llm converters  (Azure OpenAI, one call per skills/*.skill.md)
+   │  backend/app/services/external/llm/
    ▼
 converted/<app>/  { m_query__*.m, data_model.converted.json, measures.converted.json,
                      dimensions.converted.json, variables.converted.json,
                      page__*.json, rls.converted.json }
    │  pbip_build   (writes TMDL + PBIR, then pbip-compiler packs the .pbix)
+   │  backend/app/services/internal/pbip_build/
    ▼
 output/<app>/<app>.pbip  +  <app>.Report/  +  <app>.SemanticModel/  +  <app>.pbix
 ```
+
+The pipeline itself is plain Python with no framework dependency; it's used
+two ways — a CLI (`cli.py`, scriptable/CI-friendly) and a small FastAPI web
+app (`backend/`, upload/run/download from a browser) — both calling the
+exact same `extract_app` / `convert_app` / `build_project` functions. See
+[Repo layout](#repo-layout) and [Web app](#web-app) below.
 
 **Data loading:** each table's partition M loads its `extracted/<app>/data/<table>.csv`
 directly (an absolute local path baked into the M) rather than trying to
@@ -35,14 +44,50 @@ is kept under `converted/<app>/m_query__*.m` for documentation of the
 original transform logic, but the CSV-backed load always wins when both
 exist.
 
+## Repo layout
+
+```
+cli.py                          # CLI entrypoint (adds backend/ to sys.path)
+backend/
+  requirements.txt              # everything: FastAPI web layer + pipeline deps
+  uploads/<job_id>/source.qvf   # web-uploaded files land here (gitignored)
+  app/
+    main.py                     # FastAPI app: loads root .env, mounts frontend/
+    api/routes/conversion.py    # upload / run / status / logs / download endpoints
+    config/settings.py          # paths, venv python, upload limits
+    constant/constants.py       # job status enum
+    exceptions.py               # typed errors -> consistent JSON responses
+    utils/                      # file validation, per-job log capture
+    services/
+      internal/
+        job_store.py            # in-memory job/log tracking (web app only)
+        pbip_build/             # writes TMDL + PBIR, compiles the .pbix (pure, local)
+      external/
+        pipeline_runner.py      # runs extract -> convert -> build in a background thread
+        qlik/                   # Qlik Cloud REST import + Engine API client + extractor
+        llm/                    # Azure OpenAI client + converters
+          skills/                #   *.skill.md — one prompt per conversion domain
+frontend/                       # React (Vite) app: upload / run / log / download page
+  src/
+    App.jsx                     # upload -> run -> poll logs -> download state machine
+    api.js                      # fetch wrappers for /api/jobs/*
+    components/                 # UploadPanel, LogPanel
+  dist/                         # `npm run build` output — served by FastAPI (gitignored)
+extracted/<app>/, converted/<app>/, output/<app>/   # pipeline artifacts (gitignored)
+```
+
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 cp .env.example .env   # fill in QLIK_TENANT_URL, QLIK_API_KEY, AZURE_OPENAI_*
 ```
 
+The single root `.env` is shared by both the CLI and the web app.
+
 ## Usage
+
+### CLI
 
 ```bash
 # one shot: .qvf straight to a finished .pbix
@@ -62,13 +107,48 @@ placeholder row per table so the file is valid the moment it's built; the
 real rows load when Power BI runs each table's generated Power Query (M)
 step. Home ribbon → **Refresh**.
 
+### Web app
+
+The frontend is a React (Vite) app; build it once (or whenever its source
+changes) so FastAPI has something to serve, then start the API:
+
+```bash
+cd frontend
+npm install
+npm run build          # writes frontend/dist/, served by the backend at /
+
+cd ../backend
+uvicorn app.main:app --reload --port 8000
+```
+
+Open `http://127.0.0.1:8000/` — upload a `.qvf`, click **Run**, watch the
+live log (extract → convert → build streamed from the pipeline's own
+console output), then download once it finishes. Two download options are
+offered, since they're not equivalent:
+- **Download .pbix** — the compiled file, ready to open directly. Still
+  needs a Refresh (see above) to pull in real data.
+- **Download .pbip (project)** — a zip of the `.pbip` file plus its
+  `.Report/`/`.SemanticModel/` folders (Power BI Desktop needs all three
+  together to open a `.pbip`). Useful for editing the TMDL/PBIR source, or
+  for the [calculated columns/hierarchies/RLS caveat](#known-limitations-pbip-compiler-v020-alpha)
+  that only the `.pbip` (opened in Desktop, then saved as `.pbix`) currently
+  carries. It contains **no row data at all** — it's a stronger version of
+  the "click Refresh" requirement, not a lesser one.
+
+One job runs at a time.
+
+For frontend development with hot reload instead of rebuilding on every
+change, run `npm run dev` (from `frontend/`) alongside the backend — Vite's
+dev server (port 5173) proxies `/api/*` to `http://127.0.0.1:8000`.
+
 ## Confidence flags
 
 Every LLM conversion call returns a `"confidence": "high"|"medium"|"low"`
 per item (per measure, per relationship, per visual, ...) — the model's own
 judgment of how certain that specific translation is, separate from and in
-addition to the deterministic code-level checks in `pbip_build` (hallucinated
-table names, unresolved measures, relationship cycles, etc). `python cli.py
+addition to the deterministic code-level checks in `pbip_build` (under
+`backend/app/services/internal/pbip_build/`: hallucinated table names,
+unresolved measures, relationship cycles, etc). `python cli.py
 convert <app>` prints a batch summary at the end:
 ```
 [convert] confidence flags: 2 medium, 1 low — review before trusting the build
@@ -86,24 +166,27 @@ than making a wasted LLM round-trip — you'll see a
 
 ## The 8 conversion domains and where they live
 
+Skill files live under `backend/app/services/external/llm/skills/`.
+
 | # | Qlik concept | Target | Skill file |
 |---|---|---|---|
-| 2.1 | Load script (LOAD/RESIDENT/CROSSTABLE) | Power Query M | `skills/m_query.skill.md` |
-| 2.2 | Field associations | Relationships, data types | `skills/data_model.skill.md` |
-| 2.3 | Master measures (set analysis, Sum/Count) | DAX measures | `skills/dax_measures.skill.md` |
-| 2.4 | Master dimensions & drill-downs | DAX calculated columns & hierarchies | `skills/dax_columns_hierarchies.skill.md` |
-| 2.5 | Variables (vMaxYear, vCurrency) | PQ parameters or DAX measures | `skills/parameters_variables.skill.md` |
-| 2.6/2.7 | Sheets, visuals, x/y/w/h layout | Report pages & PBIR visual JSON | `skills/report_visuals.skill.md` |
-| 2.8 | Section Access (USERID/OMIT/REDUCTION) | Row-Level Security roles | `skills/rls_section_access.skill.md` |
-| — | Qlik "KPI container" config tables (a table of title/measure/color rows driving N generic KPI tiles) | Individual KPI card visuals | `skills/kpi_container.skill.md` |
+| 2.1 | Load script (LOAD/RESIDENT/CROSSTABLE) | Power Query M | `m_query.skill.md` |
+| 2.2 | Field associations | Relationships, data types | `data_model.skill.md` |
+| 2.3 | Master measures (set analysis, Sum/Count) | DAX measures | `dax_measures.skill.md` |
+| 2.4 | Master dimensions & drill-downs | DAX calculated columns & hierarchies | `dax_columns_hierarchies.skill.md` |
+| 2.5 | Variables (vMaxYear, vCurrency) | PQ parameters or DAX measures | `parameters_variables.skill.md` |
+| 2.6/2.7 | Sheets, visuals, x/y/w/h layout | Report pages & PBIR visual JSON | `report_visuals.skill.md` |
+| 2.8 | Section Access (USERID/OMIT/REDUCTION) | Row-Level Security roles | `rls_section_access.skill.md` |
+| — | Qlik "KPI container" config tables (a table of title/measure/color rows driving N generic KPI tiles) | Individual KPI card visuals | `kpi_container.skill.md` |
 
 ## What-if sliders
 
 A Qlik "variable input" slider (the `qlik-variable-input` extension — a
 control that lets the user manually drive a variable within a numeric
 range, e.g. "Sales Achievement %" from 50–150) is detected directly from
-`sheets.json` (`pbip_build/what_if_params.py`, no LLM call needed — the
-slider's own properties already carry `variableName`/`min`/`max`/`step`)
+`sheets.json` (`backend/app/services/internal/pbip_build/what_if_params.py`,
+no LLM call needed — the slider's own properties already carry
+`variableName`/`min`/`max`/`step`)
 and turned into a real Power BI equivalent: a small table holding the
 numeric range plus a `SELECTEDVALUE()` measure **named after the slider's
 own display label**. Since other measures reference that label directly
@@ -115,7 +198,8 @@ rewriting needed elsewhere. Add a slicer visual bound to that table's
 
 **Table relationships** are derived two ways and merged: the LLM's read of
 Qlik's own association metadata (`data_model.skill.md`), and a deterministic
-pass (`pbip_build/infer_relationships.py`) that compares actual column names
+pass (`backend/app/services/internal/pbip_build/infer_relationships.py`) that
+compares actual column names
 and measures each candidate key's uniqueness directly against the *real*
 exported CSV data. The data-driven pass wins when both find the same table
 pair, since it's grounded in actual row data rather than depending on Qlik
@@ -125,7 +209,7 @@ Engine API metadata whose exact behavior can vary by tenant/version.
 - A **config-table-driven** container: one table (columns like
   `Title`/`Measure`/`Bg Color`) read at runtime by a generic extension to
   render N KPI tiles, instead of each KPI being its own chart object.
-  `qlik_extract` detects such a table (heuristic: a "title" field alongside
+  The extractor detects such a table (heuristic: a "title" field alongside
   a "measure" field), `kpi_container.skill.md` resolves each row's measure
   reference (or synthesizes a new DAX measure), and `pbip_build` turns each
   row into a real card visual on a dedicated page, hiding the raw config
@@ -135,8 +219,8 @@ Engine API metadata whose exact behavior can vary by tenant/version.
 - A **native Qlik container object** (`sn-layout-container`): Qlik's
   standard "group several tiles together" object. Its real children (often
   KPI cards) aren't visible to the normal per-sheet-object extraction at
-  all — only the empty container is. `qlik_extract._expand_container` (in
-  `qlik_extract/extractor.py`) recurses into it via the Engine API's
+  all — only the empty container is. `_expand_container` (in
+  `backend/app/services/external/qlik/extractor.py`) recurses into it via the Engine API's
   `GetChildInfos` method and pulls each child's own chart data, auto-laying
   them out in a grid inside the container's bounds (the Engine API doesn't
   expose each child's exact position, only its id/type). **This path
@@ -169,8 +253,8 @@ Engine API metadata whose exact behavior can vary by tenant/version.
   faithfully — that's not deduped since they're genuinely different sheets in
   the source Qlik app.
 - Very large tables are capped at 500,000 exported rows (`MAX_ROWS_PER_TABLE`
-  in `qlik_extract/extractor.py`) as a safety limit — raise it if your app
-  has bigger tables.
+  in `backend/app/services/external/qlik/extractor.py`) as a safety limit —
+  raise it if your app has bigger tables.
 - **Calculated columns, hierarchies and RLS roles are written to the
   `.pbip`/TMDL project but are not baked into the compiled `.pbix`** — this
   version of `pbip-compiler` only carries tables, plain columns, measures and

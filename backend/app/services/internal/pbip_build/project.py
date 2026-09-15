@@ -4,6 +4,7 @@ under output/<app_name>/, then compile it to a real .pbix."""
 from __future__ import annotations
 
 import csv
+import datetime
 import glob
 import json
 import os
@@ -11,16 +12,20 @@ import re
 import shutil
 import tempfile
 
+from app.config.settings import settings
+
 from .semantic_model import write_semantic_model
 from .report import write_report
 from .pbix_compile import compile_pbix
-from .csv_m import generate_csv_partition_m, generate_partition_m
+from .csv_m import (
+    generate_partition_m, generate_combined_partition_m, generate_inline_partition_m,
+    wrap_with_left_join_aggregation,
+)
 from .infer_relationships import infer_relationships
 from .what_if_params import detect_what_if_parameters, generate_range_m
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXTRACTED_ROOT = os.path.join(ROOT, "extracted")
-CONVERTED_ROOT = os.path.join(ROOT, "converted")
+EXTRACTED_ROOT = str(settings.project_root / "extracted")
+CONVERTED_ROOT = str(settings.project_root / "converted")
 
 # Every table's CSV partition M references this one shared Power Query
 # Parameter for its base folder (see csv_m.py / semantic_model.py's
@@ -60,7 +65,7 @@ def _default_source_data_path(extracted_dir: str) -> str:
     return os.path.abspath(os.path.join(extracted_dir, "data"))
 
 
-OUTPUT_ROOT = os.path.join(ROOT, "output")
+OUTPUT_ROOT = str(settings.project_root / "output")
 
 
 def build_project(app_name: str) -> str:
@@ -71,16 +76,27 @@ def build_project(app_name: str) -> str:
     os.makedirs(project_dir, exist_ok=True)
 
     (tables, measures_by_table, calc_cols_by_table, hierarchies_by_table,
-     original_measure_table) = _assemble_semantic_inputs(extracted_dir, converted_dir)
+     original_measure_table, required_relationship_orientations) = _assemble_semantic_inputs(extracted_dir, converted_dir)
 
     llm_relationships = _load_json(converted_dir, "data_model.converted.json").get("relationships", [])
     inferred_relationships = infer_relationships(tables, extracted_dir)
     relationships = _merge_relationships(llm_relationships, inferred_relationships)
+    relationships = _orient_relationships_for_related(relationships, required_relationship_orientations)
+    relationships = _drop_relationships_into_related_calc_tables(relationships, tables)
     roles = _load_json(converted_dir, "rls.converted.json").get("roles", [])
     parameters = _load_json(converted_dir, "variables.converted.json").get("variables", [])
     parameters = [p for p in parameters if p.get("target") == "power_query_parameter"]
 
     pages = _load_pages(converted_dir)
+
+    # A Qlik sheet built from its own "Data Model Viewer" (a table listing
+    # $Table/$Rows/$Field/... — Qlik's built-in introspection system
+    # fields, not real data) has no Power BI equivalent: there's no "Model"
+    # table, and never will be, so leaving the binding as-is always shows
+    # "fields that need to be fixed". Swap any such visual for a plain
+    # textbox noting what it was, the same fallback already used for any
+    # other genuinely unrepresentable Qlik object.
+    _replace_system_field_visuals(pages)
 
     # Sheet-local KPI expressions that never made it into the app's master
     # measures list (e.g. a single "Sum([ClosingStock])" typed straight into
@@ -94,6 +110,25 @@ def build_project(app_name: str) -> str:
     label_to_agg, label_to_field = _build_sheet_label_lookups(extracted_dir)
     kpi_object_titles = _build_kpi_object_titles(extracted_dir)
     _synthesize_adhoc_measures(pages, tables, measures_by_table, original_measure_table, label_to_agg)
+
+    # A Qlik KPI can be a hard-coded constant wrapped in Sum() (e.g.
+    # "=Sum(5)") — a common idiom for a static target/placeholder tile, not
+    # a real aggregation over any field. report_visuals recognizes this (it
+    # says so in the visual's own "notes": "Placeholder measure 'Sum5'
+    # (value=5)") but still binds the visual to a FABRICATED table
+    # ("MeasureTable") and measure name that exist nowhere in the model —
+    # Power BI reports that as "Fields that need to be fixed". Give the
+    # fabricated measure name a real, constant-valued DAX measure so the
+    # existing binding resolves naturally instead of pointing at nothing.
+    _synthesize_placeholder_constant_measures(pages, tables, measures_by_table, original_measure_table)
+
+    # A Qlik "Last reload"/ReloadTime() KPI has no field in the .qvf script
+    # to bind to (it's a Qlik system value, not stored data) — deliberately
+    # NOT reproduced with an invented supporting table. The goal is to match
+    # what's in the Qlik app's own script/data model, not add infrastructure
+    # Qlik never had; that placeholder is left to _fix_field_and_measure_refs'
+    # normal unresolved-projection handling (dropped/warned, same as any
+    # other field that can't be resolved) rather than synthesized.
 
     # A Qlik "variable input" slider (e.g. qlik-variable-input) lets the user
     # manually drive a variable's value within a numeric range — other
@@ -130,6 +165,7 @@ def build_project(app_name: str) -> str:
     _rewrite_renamed_measure_refs(measures_by_table, calc_cols_by_table, what_if_renamed)
     _rewrite_renamed_measure_refs(measures_by_table, calc_cols_by_table, rename_map)
     _fix_measure_self_references(measures_by_table, calc_cols_by_table, tables)
+    _wrap_bare_measure_refs(measures_by_table, calc_cols_by_table, original_measure_table)
     _fix_phantom_table_refs(measures_by_table, calc_cols_by_table, tables)
 
     # Deterministic last line of defence against the single most common
@@ -413,13 +449,603 @@ def _build_calendar_table(table_name: str, raw_fields: list[dict]) -> dict | Non
     return {"columns": columns, "m_expression": "", "is_calculated": True, "dax_expression": dax_expression}
 
 
+# A Qlik "rolling aggregate" table: computed with RESIDENT + GROUP BY over
+# another already-loaded table, grouped by a key pulled from a separate
+# `Mapping LOAD` table via ApplyMap() — e.g. a rolling-N-day distinct count
+# per customer, where the customer id isn't a stored field on the source
+# table itself. It was never a source FILE either (RESIDENT reads another
+# in-app table, not `FROM [lib://...]`), so it has no CSV to point
+# SourceDataPath at — it needs to become a DAX calculated table instead,
+# same idea as the master-calendar handling below.
+_MAPPING_TABLE_RE = re.compile(
+    r"\b(?P<name>\w+):\s*Mapping\s+LOAD\s+(?P<key>\w+)\s*,\s*(?P<value>\w+)\s*RESIDENT\s+(?P<source>\w+)",
+    re.IGNORECASE,
+)
+_GROUPBY_APPLYMAP_COUNT_RE = re.compile(
+    r"\b(?P<table>\w+):\s*LOAD\s+"
+    r"ApplyMap\(\s*'(?P<map>\w+)'\s*,\s*(?P<key>\w+)\s*\)\s+AS\s+(?P<alias>\w+)\s*,\s*"
+    r"Count\(\s*DISTINCT\s+(?P<countfield>\w+)\s*\)\s+AS\s+(?P<measure>\w+)\s*"
+    r"RESIDENT\s+(?P<source>\w+)\s*"
+    r"(?:WHERE\s+(?P<wfield>\w+)\s*(?P<op>>=|<=|>|<|=)\s*'(?P<wval>[^']+)'\s*)?"
+    r"GROUP\s+BY\s+ApplyMap\(\s*'(?P=map)'\s*,\s*(?P=key)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _detect_groupby_count_tables(script_text: str) -> dict[str, dict]:
+    """{table_name: {source_table, key_field, count_field, measure_name,
+    group_alias, value_field, value_source_table, where_field, where_op,
+    where_val}} for every RESIDENT+GROUP BY-via-ApplyMap table found, with
+    its ApplyMap() resolved back to the real table/column it actually reads
+    (through the matching `Mapping LOAD`)."""
+    mappings = {}
+    for m in _MAPPING_TABLE_RE.finditer(script_text):
+        mappings[m.group("name").casefold()] = {
+            "key_field": m.group("key"), "value_field": m.group("value"), "source_table": m.group("source"),
+        }
+    out: dict[str, dict] = {}
+    for m in _GROUPBY_APPLYMAP_COUNT_RE.finditer(script_text):
+        mapping = mappings.get(m.group("map").casefold())
+        if not mapping:
+            continue
+        out[m.group("table")] = {
+            "source_table": m.group("source"),
+            "key_field": m.group("key"),
+            "count_field": m.group("countfield"),
+            "measure_name": m.group("measure"),
+            "group_alias": m.group("alias"),
+            "value_field": mapping["value_field"],
+            "value_source_table": mapping["source_table"],
+            "where_field": m.group("wfield"),
+            "where_op": m.group("op"),
+            "where_val": m.group("wval"),
+        }
+    return out
+
+
+def _qlik_date_literal_to_dax(literal: str) -> str:
+    try:
+        d = datetime.datetime.strptime(literal, "%Y-%m-%d")
+        return f"DATE({d.year}, {d.month}, {d.day})"
+    except ValueError:
+        # Not the ISO format this script happened to use — fall back to
+        # DATEVALUE, which still compares correctly against a real `date`
+        # column regardless of the literal's original text format.
+        return f'DATEVALUE("{literal}")'
+
+
+def _build_groupby_count_table(table_name: str, spec: dict, fields_by_table: dict[str, set[str]]) -> dict | None:
+    source_table = spec["source_table"]
+    value_table = spec["value_source_table"]
+    key_field = spec["key_field"]
+    if source_table not in fields_by_table or value_table not in fields_by_table:
+        return None
+    if key_field not in fields_by_table[source_table] or key_field not in fields_by_table[value_table]:
+        return None
+    if spec["value_field"] not in fields_by_table[value_table]:
+        return None
+    if spec["count_field"] not in fields_by_table[source_table]:
+        return None
+
+    base = source_table
+    if spec["where_field"] and spec["where_field"] in fields_by_table[source_table] and spec["where_val"]:
+        date_expr = _qlik_date_literal_to_dax(spec["where_val"])
+        base = f"FILTER({source_table}, {source_table}[{spec['where_field']}] {spec['where_op']} {date_expr})"
+
+    dax_expression = (
+        "SUMMARIZE(\n"
+        f'    ADDCOLUMNS(\n        {base},\n'
+        f'        "{spec["group_alias"]}", RELATED({value_table}[{spec["value_field"]}])\n    ),\n'
+        f'    [{spec["group_alias"]}],\n'
+        f'    "{spec["measure_name"]}", DISTINCTCOUNT({source_table}[{spec["count_field"]}])\n'
+        ")"
+    )
+    columns = [
+        {"name": spec["group_alias"], "data_type": "string", "source_column": spec["group_alias"]},
+        {"name": spec["measure_name"], "data_type": "int64", "source_column": spec["measure_name"]},
+    ]
+    print(f"[build] '{table_name}' detected as a Qlik RESIDENT/GROUP BY aggregate over '{source_table}' "
+          f"(the group key resolves via mapping to '{value_table}[{spec['value_field']}]') — building it "
+          f"as a DAX calculated table (RELATED + SUMMARIZE) instead of loading from CSV: it was never a "
+          f"source file in Qlik either, it's computed at load time from '{source_table}'.")
+    return {"columns": columns, "m_expression": "", "is_calculated": True, "dax_expression": dax_expression}
+
+
+_MONTH_DERIVED_RE = re.compile(
+    r"\b(Month|MonthName)\s*\(\s*(?:Date#\(\s*)?([A-Za-z_]\w*)(?:\s*,[^)]*\))?\s*\)\s+[Aa][Ss]\s+([A-Za-z_]\w*)"
+)
+
+
+def _detect_month_derived_columns(script_text: str) -> dict[str, dict]:
+    """Find every `Month(...)`/`MonthName(...)  AS <Field>` in the Qlik LOAD
+    script and return {target_field.casefold(): {"func", "source"}} — these
+    fields are computed by Qlik at load time from another field ALREADY in
+    the same LOAD, never read from the source file, regardless of what the
+    source file actually contains. Used to reproduce the same computation in
+    the generated Power Query M instead of expecting the source CSV to have
+    them (see csv_m.py)."""
+    out: dict[str, dict] = {}
+    for m in _MONTH_DERIVED_RE.finditer(script_text):
+        func, source_field, target_field = m.group(1), m.group(2), m.group(3)
+        out[target_field.casefold()] = {"func": func, "source": source_field}
+    return out
+
+
+_LOAD_BLOCK_RE = re.compile(
+    # Field list ends at whichever comes first: a real FROM/RESIDENT clause,
+    # or a statement-ending ";" — a LOAD with neither (LOAD ... INLINE [...]
+    # has no FROM/RESIDENT at all) would otherwise make the non-greedy `.*?`
+    # keep expanding straight through the INLINE block and into whatever
+    # table's LOAD comes NEXT in the script, misattributing its entire field
+    # list (and anything a caller detects in it) to THIS table instead.
+    r"\b(\w+):\s*LOAD\s+(.*?)\s*(?:\bFROM\b|\bRESIDENT\b|;)", re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split a Qlik LOAD field list on commas that are NOT inside a
+    function call's parentheses or a quoted string — a plain str.split(",")
+    would wrongly cut `Count(DISTINCT A, B)` (no such case here, but general
+    LOAD lists can nest commas) apart into fragments."""
+    items, depth, quote, start = [], 0, None, 0
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(text[start:i])
+            start = i + 1
+    items.append(text[start:])
+    return items
+
+
+_SIMPLE_RENAME_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$")
+
+
+_TABLE_LABEL_LOAD_RE = re.compile(r"\b(\w+):\s*\r?\n\s*(?:mapping\s+)?(?:LOAD|SELECT)\b", re.IGNORECASE)
+_CONCAT_JOIN_PREFIX_RE = re.compile(
+    r"\b(?:concatenate|join|left\s+join|right\s+join|inner\s+join|outer\s+join)\s*\(\s*(\w+)\s*\)",
+    re.IGNORECASE,
+)
+_FROM_FILE_RE = re.compile(r"\bFROM\s*\[([^\]]+)\]", re.IGNORECASE)
+
+
+def _detect_source_files(script_text: str) -> dict[str, list[str]]:
+    """The real CSV file(s) each table actually loads from, per the Qlik
+    script itself — NEVER assume a table's source file is named after the
+    table (`{TableName}.csv`): the two commonly disagree (seen: table
+    `Dim_Product` loads `FROM [.../Product_Master.csv]`, `Dim_Zones` loads
+    `Zone_Master.csv`, etc. — every single-source table in one real app had
+    a different file name than its table name). Also handles a table built
+    from SEVERAL source files loaded one after another — either several
+    unlabeled `LOAD ... FROM [...]` blocks in a row (Qlik auto-concatenates
+    a LOAD with no table name of its own onto whichever table is currently
+    "in scope"), or an explicit `Concatenate(TableName) LOAD ... FROM
+    [...]`. Only the FIRST block carries the `TableName:` label; a
+    script-parser that only recognizes labeled blocks (see _LOAD_BLOCK_RE
+    and friends) only ever sees that first file and silently ignores the
+    rest.
+
+    Walks the script sequentially tracking which table is "current" (set by
+    a `TableName:` label or a Concatenate/Join(...) prefix) and records
+    every `FROM [...]` filename against it, in the order the script loads
+    them — a `Join`/`Left Join`/etc. (merges COLUMNS from a RESIDENT
+    aggregation, not more rows from a file) naturally contributes no FROM
+    file and so never shows up here.
+
+    Returns {table_name: [filename, ...]} for every table with at least one
+    detected source file (most tables: exactly one entry — still use it
+    instead of guessing `{table}.csv`; a table with none found at all, e.g.
+    built from `LOAD ... INLINE [...]` or purely from other RESIDENT
+    tables, isn't in this dict — callers fall back to their own default for
+    those)."""
+    events: list[tuple[int, str, str]] = []
+    for m in _TABLE_LABEL_LOAD_RE.finditer(script_text):
+        events.append((m.start(), "current_table", m.group(1)))
+    for m in _CONCAT_JOIN_PREFIX_RE.finditer(script_text):
+        events.append((m.start(), "current_table", m.group(1)))
+    for m in _FROM_FILE_RE.finditer(script_text):
+        # Just the filename — the lib:// connection path is only valid on
+        # the machine that authored the .qvf; every table's M already
+        # resolves against the shared SourceDataPath parameter instead.
+        filename = re.split(r"[/\\]", m.group(1))[-1]
+        events.append((m.start(), "from", filename))
+    events.sort(key=lambda e: e[0])
+
+    sources_by_table: dict[str, list[str]] = {}
+    current_table: str | None = None
+    for _, kind, value in events:
+        if kind == "current_table":
+            current_table = value
+        elif current_table:
+            files = sources_by_table.setdefault(current_table, [])
+            if value not in files:
+                files.append(value)
+    return sources_by_table
+
+
+_INLINE_TABLE_RE = re.compile(
+    r"\b(\w+):\s*\r?\n\s*LOAD\s+(?:\*|[^\[\];]*?)\s*INLINE\s*\[(.*?)\]", re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_inline_csv_line(line: str) -> list[str]:
+    return [cell.strip().strip("'\"") for cell in _split_top_level_commas(line)]
+
+
+def _detect_inline_tables(script_text: str) -> dict[str, list[dict[str, str]]]:
+    """A Qlik `LOAD * INLINE [header\\nrow1\\nrow2...]` table — literal rows
+    typed directly into the script, not sourced from any file at all (seen:
+    a small lookup/config table like a manager/zone assignment list). A
+    build that assumes every table has a `{TableName}.csv` (or even any
+    file) to load from fails outright for one of these — "Could not find
+    file" — since no such file was ever meant to exist. Parsed as a simple
+    comma-separated block (Qlik's own INLINE syntax): first line is the
+    header, everything after is data rows.
+
+    Returns {table_name: [{"ColName": "value", ...}, ...]}."""
+    out: dict[str, list[dict[str, str]]] = {}
+    for m in _INLINE_TABLE_RE.finditer(script_text):
+        table_name, block = m.group(1), m.group(2)
+        lines = [ln for ln in (raw.strip() for raw in block.splitlines()) if ln]
+        if not lines:
+            continue
+        header = _split_inline_csv_line(lines[0])
+        rows = []
+        for line in lines[1:]:
+            cells = _split_inline_csv_line(line)
+            rows.append({h: (cells[i] if i < len(cells) else "") for i, h in enumerate(header)})
+        out[table_name] = rows
+    return out
+
+
+def _detect_simple_renamed_columns(script_text: str) -> dict[str, dict[str, str]]:
+    """Find every LOAD field that's a bare rename — `RiskBand AS
+    PredictedRiskBand`, nothing else on either side — per table. Anchored to
+    the WHOLE field expression (not just "immediately before AS") so a
+    concatenation like `chr(10) & InsightText AS Insights` is correctly NOT
+    treated as a rename of InsightText (it's a computed expression, out of
+    scope here — the field expression as a whole isn't just one identifier).
+
+    A source CSV that mirrors the Qlik table's ORIGINAL columns (rather than
+    its post-script output) still has the field under its OLD name — e.g.
+    the file has "RiskBand" but the model/measures expect "PredictedRiskBand"
+    — so `Table.SelectColumns` by the new name alone finds nothing and the
+    column loads as null even though the file genuinely has the data under
+    its other name. Reproduce the rename in Power Query instead (see
+    csv_m.py) rather than expecting the file to already use the new name.
+
+    Returns {table_name: {target_field.casefold(): source_field}}."""
+    out: dict[str, dict[str, str]] = {}
+    for block in _LOAD_BLOCK_RE.finditer(script_text):
+        table_name, field_list = block.group(1), block.group(2)
+        renames: dict[str, str] = {}
+        for item in _split_top_level_commas(field_list):
+            m = _SIMPLE_RENAME_RE.match(item)
+            if not m:
+                continue
+            source_field, target_field = m.group(1), m.group(2)
+            if source_field.casefold() != target_field.casefold():
+                renames[target_field.casefold()] = source_field
+        if renames:
+            out[table_name] = renames
+    return out
+
+
+# Chr(N) is Qlik's function for a literal character by its Unicode/ASCII
+# code point (Chr(10) = line feed) — Power Query's exact equivalent is
+# Character.FromNumber(N) (confirmed against Qlik's own Chr() docs and the
+# Power Query M reference). Covers both orderings: the literal character
+# concatenated before OR after the real field.
+_CHR_PREFIX_RE = re.compile(r"^\s*chr\(\s*(\d+)\s*\)\s*&\s*([A-Za-z_]\w*)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$", re.IGNORECASE)
+_CHR_SUFFIX_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*&\s*chr\(\s*(\d+)\s*\)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$", re.IGNORECASE)
+
+
+def _detect_chr_concat_columns(script_text: str) -> dict[str, dict[str, dict]]:
+    """Find every LOAD field that's `Chr(<code>) & <Field> AS <Target>` (or
+    the same with the order flipped) — e.g. `chr(10) & InsightText AS
+    Insights`, a Qlik idiom for prefixing/suffixing a real field with a
+    literal character (very often a line break before a text block). Like
+    _detect_simple_renamed_columns, this is a genuinely COMPUTED field, not
+    something any source file was ever going to contain under the target
+    name — reproduced as its own Power Query step (see csv_m.py) instead of
+    silently loading as null.
+
+    Returns {table_name: {target_field: {"func": "ChrConcat", "source":
+    field, "code": int, "prefix": bool}}} — merged into the same `computed`
+    dict _detect_month_derived_columns feeds (same downstream plumbing)."""
+    out: dict[str, dict[str, dict]] = {}
+    for block in _LOAD_BLOCK_RE.finditer(script_text):
+        table_name, field_list = block.group(1), block.group(2)
+        found: dict[str, dict] = {}
+        for item in _split_top_level_commas(field_list):
+            m = _CHR_PREFIX_RE.match(item)
+            if m:
+                code, source_field, target_field = m.group(1), m.group(2), m.group(3)
+                found[target_field.casefold()] = {"func": "ChrConcat", "source": source_field, "code": int(code), "prefix": True}
+                continue
+            m = _CHR_SUFFIX_RE.match(item)
+            if m:
+                source_field, code, target_field = m.group(1), m.group(2), m.group(3)
+                found[target_field.casefold()] = {"func": "ChrConcat", "source": source_field, "code": int(code), "prefix": False}
+        if found:
+            out[table_name] = found
+    return out
+
+
+# Qlik's idiom for a composite surrogate key from two text fields, avoiding
+# a synthetic key when two tables need to join on a combination of columns
+# neither has alone: `dual(A & 'sep' & B, autonumber(A & 'sep' & B)) as
+# Target` — a "dual" value that DISPLAYS as the concatenated text but
+# SORTS/COMPARES as the autonumber()-assigned integer. DAX/Power Query have
+# no equivalent dual-value type, and there's no way to reproduce Qlik's own
+# autonumber() sequence outside Qlik anyway — but a relationship only needs
+# the two sides to agree on a single, unique key value, not specifically a
+# number, so the plain text concatenation alone (dropping the numeric
+# "display as" half) is a completely faithful substitute: same value,
+# same join behavior, just stored as text instead of a dual.
+_DUAL_AUTONUMBER_KEY_RE = re.compile(
+    r"^\s*dual\(\s*([A-Za-z_]\w*)\s*&\s*'([^']*)'\s*&\s*([A-Za-z_]\w*)\s*,\s*"
+    r"autonumber\(\s*\1\s*&\s*'[^']*'\s*&\s*\3\s*\)\s*\)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _detect_dual_autonumber_keys(script_text: str) -> dict[str, dict[str, dict]]:
+    """Find every `dual(A & 'sep' & B, autonumber(A & 'sep' & B)) AS Target`
+    field. Left unhandled, `Target` matches no column in any source file
+    (it's 100% computed, never a stored field) and loads as blank for every
+    row — which for a key column doesn't just leave one field empty, it
+    breaks the one-to-one/primary-key constraint on whatever relationship
+    uses it and can cancel refresh of the ENTIRE model, not just this table
+    (seen: "Column 'ProductKey' ... contains blank values ..." plus every
+    other table in the same refresh reporting "Load was cancelled by an
+    error in loading a previous table").
+
+    Returns {table_name: {target_field.casefold(): {"func": "ConcatKey",
+    "field_a", "field_b", "sep"}}} — merged into the same `computed` dict
+    the other script-derived-column detectors feed."""
+    out: dict[str, dict[str, dict]] = {}
+    for block in _LOAD_BLOCK_RE.finditer(script_text):
+        table_name, field_list = block.group(1), block.group(2)
+        found: dict[str, dict] = {}
+        for item in _split_top_level_commas(field_list):
+            m = _DUAL_AUTONUMBER_KEY_RE.match(item)
+            if not m:
+                continue
+            field_a, sep, field_b, target_field = m.group(1), m.group(2), m.group(3), m.group(4)
+            found[target_field.casefold()] = {"func": "ConcatKey", "field_a": field_a, "field_b": field_b, "sep": sep}
+        if found:
+            out[table_name] = found
+    return out
+
+
+# A Qlik `mapping LOAD key, value FROM [...]` table — a small lookup table
+# (not a real data table; never gets its own TMDL table in Power BI, only
+# ever read via ApplyMap()) whose two columns are its key and value. Only
+# the plain "load straight from a file" shape is handled here — a mapping
+# table itself built from RESIDENT/INLINE is out of scope for now.
+_MAPPING_FROM_FILE_RE = re.compile(
+    r"\b(?P<name>\w+):\s*mapping\s+LOAD\s+(?P<key>\w+)\s*,\s*(?P<value>\w+)\s*FROM\s*\[",
+    re.IGNORECASE,
+)
+
+
+def _detect_mapping_tables(script_text: str) -> dict[str, dict]:
+    """{map_name.casefold(): {"key_field", "value_field", "table_label"}}
+    for every `mapping LOAD key, value FROM [...]` block — `table_label` is
+    the mapping table's own script label (e.g. "map"), used to look its
+    source filename up in `_detect_source_files`'s result (that function
+    already treats a `mapping LOAD` label as its own table, same as any
+    real one)."""
+    out: dict[str, dict] = {}
+    for m in _MAPPING_FROM_FILE_RE.finditer(script_text):
+        out[m.group("name").casefold()] = {
+            "key_field": m.group("key"), "value_field": m.group("value"), "table_label": m.group("name"),
+        }
+    return out
+
+
+# Qlik's SubField(ApplyMap('map', Field, 'default'), 'sep', N) AS Target —
+# looks Field up in a mapping table (falling back to 'default' when
+# unmatched), then splits whatever comes back on 'sep' and takes the Nth
+# (1-based) piece. Seen reproducing a "Region" field from a
+# City -> "Zone-Region" mapping table via SubField(..., '-', 2). Anchored
+# to the WHOLE field expression, same convention as every other computed-
+# column detector here.
+_APPLYMAP_SUBFIELD_RE = re.compile(
+    r"^\s*SubField\(\s*ApplyMap\(\s*'(?P<map>[^']+)'\s*,\s*([A-Za-z_]\w*)\s*,\s*'(?P<default>[^']*)'\s*\)\s*,\s*"
+    r"'(?P<sep>[^']*)'\s*,\s*(?P<part>\d+)\s*\)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _detect_applymap_subfield_columns(script_text: str) -> dict[str, dict[str, dict]]:
+    """Find every `SubField(ApplyMap('map', Field, 'default'), 'sep', N) AS
+    Target` field, per table. Left unhandled, `Target` matches no column in
+    any source file (it's 100% computed from a SEPARATE mapping file, never
+    a stored field of this table) and loads as blank for every row — which
+    then breaks any measure/filter built on it (e.g. `WHERE Region =
+    "Unassigned"` never matches when Region is always null).
+
+    Returns {table_name: {target_field.casefold(): {"func":
+    "ApplyMapSubfield", "map_name", "source" (the field looked up),
+    "default", "sep", "part_index" (0-based)}}} — merged into the same
+    `computed` dict the other script-derived-column detectors feed. The
+    mapping table's own key/value fields and source filename are resolved
+    separately (see _detect_mapping_tables / source_files_by_table) once
+    both are available, in _assemble_semantic_inputs."""
+    out: dict[str, dict[str, dict]] = {}
+    for block in _LOAD_BLOCK_RE.finditer(script_text):
+        table_name, field_list = block.group(1), block.group(2)
+        found: dict[str, dict] = {}
+        for item in _split_top_level_commas(field_list):
+            m = _APPLYMAP_SUBFIELD_RE.match(item)
+            if not m:
+                continue
+            map_name, source_field, default, sep, part, target_field = m.groups()
+            found[target_field.casefold()] = {
+                "func": "ApplyMapSubfield", "map_name": map_name, "source": source_field,
+                "default": default, "sep": sep, "part_index": int(part) - 1,
+            }
+        if found:
+            out[table_name] = found
+    return out
+
+
+# `left join(Target) LOAD <fields> RESIDENT Source ... GROUP BY <keys>;` —
+# Qlik joins an aggregate computed from another already-loaded table's rows
+# onto Target's own columns (matched on the shared key field names — Qlik's
+# join is associative on common field names, no explicit ON clause). A
+# script-parser that only reads FROM-file LOADs never sees this at all: the
+# joined column has no source file of its own, so it silently loads as
+# blank in Target regardless of what its source file actually contains,
+# which then blanks out any measure built on it.
+_JOIN_RESIDENT_GROUPBY_RE = re.compile(
+    r"\bleft\s+join\s*\(\s*(\w+)\s*\)\s*\r?\n\s*load\s+(.*?)\s*"
+    r"resident\s+(\w+)\s*(?:where\s+.*?)?group\s+by\s+.*?;",
+    re.IGNORECASE | re.DOTALL,
+)
+_JOIN_AGG_ITEM_RE = re.compile(r"^\s*(sum|count|avg|min|max)\s*\(\s*([A-Za-z_]\w*)\s*\)\s+[Aa][Ss]\s+\"?([A-Za-z_]\w*)\"?\s*$")
+_JOIN_KEYFUNC_ITEM_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*)\s*\)\s+[Aa][Ss]\s+\"?([A-Za-z_]\w*)\"?\s*$")
+_BARE_FIELD_ITEM_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*$")
+
+# Qlik function -> M equivalent, for the (typically date-bucketing) key
+# expression a GROUP BY commonly uses — only these are supported; a group
+# key using any other function makes the whole table's detection back off
+# (print a warning, leave the joined column blank as before) rather than
+# guess at an unfamiliar function's M translation.
+_QLIK_TO_M_DATE_FUNC = {
+    "monthstart": "Date.StartOfMonth", "monthend": "Date.EndOfMonth",
+    "year": "Date.Year", "month": "Date.Month",
+    "weekstart": "Date.StartOfWeek", "weekend": "Date.EndOfWeek",
+}
+_QLIK_TO_M_AGG_FUNC = {"sum": "List.Sum", "count": "List.Count", "avg": "List.Average", "min": "List.Min", "max": "List.Max"}
+
+
+def _detect_join_resident_aggregations(script_text: str) -> dict[str, dict]:
+    """Returns {target_table: {"source_table": ..., "group_by": [{"alias",
+    "func", "field"}, ...], "aggregations": [{"alias", "func", "field"},
+    ...]}} for a `left join(Target) LOAD ... RESIDENT Source ... GROUP BY
+    ...` block whose every field is one of: a bare group-by key, a
+    recognized-function group-by key (see _QLIK_TO_M_DATE_FUNC), or a
+    recognized aggregation (see _QLIK_TO_M_AGG_FUNC). Reproduced in
+    csv_m.wrap_with_left_join_aggregation as Table.Group + Table.NestedJoin
+    against the OTHER table's own M query, referenced by name — Power
+    Query resolves cross-query references into the correct refresh order
+    automatically, the same way Qlik's own script does this at load time."""
+    out: dict[str, dict] = {}
+    for m in _JOIN_RESIDENT_GROUPBY_RE.finditer(script_text):
+        target_table, field_list, source_table = m.group(1), m.group(2), m.group(3)
+        group_by: list[dict] = []
+        aggregations: list[dict] = []
+        ok = True
+        for item in _split_top_level_commas(field_list):
+            am = _JOIN_AGG_ITEM_RE.match(item)
+            if am:
+                func = am.group(1).casefold()
+                if func not in _QLIK_TO_M_AGG_FUNC:
+                    ok = False
+                    break
+                aggregations.append({"func": func, "field": am.group(2), "alias": am.group(3)})
+                continue
+            fm = _JOIN_KEYFUNC_ITEM_RE.match(item)
+            if fm:
+                func = fm.group(1).casefold()
+                if func not in _QLIK_TO_M_DATE_FUNC:
+                    ok = False
+                    break
+                group_by.append({"func": func, "field": fm.group(2), "alias": fm.group(3)})
+                continue
+            bm = _BARE_FIELD_ITEM_RE.match(item)
+            if bm:
+                group_by.append({"func": "identity", "field": bm.group(1), "alias": bm.group(1)})
+                continue
+            ok = False
+            break
+        if ok and group_by and aggregations:
+            out[target_table] = {"source_table": source_table, "group_by": group_by, "aggregations": aggregations}
+        elif not ok:
+            print(f"[build] NOTE: '{target_table}' has a LEFT JOIN ... RESIDENT ... GROUP BY block that "
+                  f"doesn't match a recognized simple aggregation shape — left unreproduced (the joined "
+                  f"column(s) will load blank); add it by hand in Power BI Desktop if needed")
+    return out
+
+
 def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
     raw_data_model = _load_json(extracted_dir, "data_model.json")
+    if not raw_data_model.get("tables"):
+        script_path = os.path.join(extracted_dir, "script.qvs")
+        script_has_load = False
+        if os.path.exists(script_path):
+            with open(script_path, encoding="utf-8") as f:
+                script_has_load = bool(re.search(r"\bLOAD\b", f.read(), re.IGNORECASE))
+        if script_has_load:
+            raise RuntimeError(
+                f"'{os.path.basename(extracted_dir)}': data_model.json has 0 tables but "
+                "script.qvs clearly has LOAD statements — extraction produced an "
+                "incomplete result (a build would only produce synthetic tables like "
+                "a what-if slider range, nothing real). Re-run extract for this app "
+                "instead of building from this extracted data."
+            )
     converted_data_model = _load_json(converted_dir, "data_model.converted.json")
     column_types = converted_data_model.get("column_types", {})
     calendar_table_names = _detect_master_calendar_tables(raw_data_model)
 
+    script_path = os.path.join(extracted_dir, "script.qvs")
+    month_derived: dict[str, dict] = {}
+    groupby_count_tables: dict[str, dict] = {}
+    renamed_by_table: dict[str, dict[str, str]] = {}
+    chr_concat_by_table: dict[str, dict[str, dict]] = {}
+    dual_key_by_table: dict[str, dict[str, dict]] = {}
+    source_files_by_table: dict[str, list[str]] = {}
+    inline_tables: dict[str, list[dict[str, str]]] = {}
+    join_agg_by_table: dict[str, dict] = {}
+    mapping_tables: dict[str, dict] = {}
+    applymap_by_table: dict[str, dict[str, dict]] = {}
+    if os.path.exists(script_path):
+        with open(script_path, encoding="utf-8") as f:
+            script_text = f.read()
+        month_derived = _detect_month_derived_columns(script_text)
+        groupby_count_tables = _detect_groupby_count_tables(script_text)
+        renamed_by_table = _detect_simple_renamed_columns(script_text)
+        chr_concat_by_table = _detect_chr_concat_columns(script_text)
+        dual_key_by_table = _detect_dual_autonumber_keys(script_text)
+        source_files_by_table = _detect_source_files(script_text)
+        inline_tables = _detect_inline_tables(script_text)
+        join_agg_by_table = _detect_join_resident_aggregations(script_text)
+        mapping_tables = _detect_mapping_tables(script_text)
+        applymap_by_table = _detect_applymap_subfield_columns(script_text)
+
+    fields_by_table: dict[str, set[str]] = {}
+    for rt in raw_data_model.get("tables", []):
+        rt_name = rt.get("qName") or rt.get("name")
+        if rt_name:
+            fields_by_table[rt_name] = {
+                f.get("qName") or f.get("name")
+                for f in rt.get("qFields", rt.get("fields", []))
+                if f.get("qName") or f.get("name")
+            }
+
     tables: dict[str, dict] = {}
+    # A RESIDENT/GROUP BY calculated table's own DAX does RELATED(<value
+    # table>[...]) while iterating <source table> — that REQUIRES <source
+    # table> to be the many side and <value table> the one side of whatever
+    # relationship connects them, regardless of which direction that
+    # relationship happens to already point (e.g. the LLM's data_model
+    # conversion, or infer_relationships, may have called the OTHER table
+    # "many" for unrelated reasons — DisputeFact can have more than one
+    # dispute per invoice, making it genuinely the many side relative to
+    # ARFact for this pair, even where ARFact is the many/fact side of
+    # every OTHER relationship in the model). Collected here and applied
+    # after relationships are merged, in build_project.
+    required_relationship_orientations: list[tuple[str, str]] = []
     for raw_table in raw_data_model.get("tables", []):
         table_name = raw_table.get("qName") or raw_table.get("name")
         if not table_name:
@@ -431,6 +1057,17 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
             if calendar_table:
                 tables[table_name] = calendar_table
                 continue
+
+        if table_name in groupby_count_tables:
+            spec = groupby_count_tables[table_name]
+            gb_table = _build_groupby_count_table(table_name, spec, fields_by_table)
+            if gb_table:
+                tables[table_name] = gb_table
+                required_relationship_orientations.append((spec["source_table"], spec["value_source_table"]))
+                continue
+            print(f"[build] WARNING: '{table_name}' looks like a RESIDENT/GROUP BY aggregate table but its "
+                  f"source fields/mapping couldn't be fully resolved — building it as a normal CSV-loaded "
+                  f"table instead (it will need a CSV of its own, which Qlik never had either)")
 
         table_col_types = column_types.get(table_name, {})
         columns = []
@@ -451,31 +1088,178 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                 # computed directly here, rather than guessing "string".
                 dtype = _infer_column_type(f)
                 skipped_by_llm += 1
+            if (dtype in ("int64", "double") and "month" in fname.casefold()
+                    and fname.casefold() not in month_derived):
+                # A field whose NAME is specifically about a month (not
+                # numeric fields generally) can genuinely hold either shape
+                # depending on the real source file: "6"/"06" or "Jun"/
+                # "June" — force-converting the text form to a number (or
+                # nulling it) loses information either way. "variant" is a
+                # real Tabular column type for exactly this — it stores
+                # whatever the Power Query step actually produces, number or
+                # text, without forcing a single type (see csv_m.py's
+                # variant_cols handling: numeric text becomes a real number,
+                # anything else passes through unchanged as text).
+                # Excludes month_derived fields (e.g. InvoiceMonthNum) —
+                # those are always computed via Date.Month(...) in Power
+                # Query, never read from the source file, so they're
+                # reliably int64 already; no ambiguity to guard against.
+                dtype = "variant"
             columns.append({"name": fname, "data_type": dtype, "source_column": fname})
         if skipped_by_llm:
             print(f"[build] {table_name}: {skipped_by_llm} column(s) not classified by the data model "
                   f"conversion — inferred type from Qlik field tags instead")
-        csv_filename = f"{_safe(table_name)}.csv"
-        csv_path = os.path.join(extracted_dir, "data", csv_filename)
-        if os.path.exists(csv_path):
-            # Real data extracted straight from the Qlik app takes priority
-            # over the LLM's best-effort reconstruction of the original load
-            # script, which usually points at a source (file path / DB) only
-            # reachable from the machine that authored the .qvf. Every
-            # table's M resolves its file against the shared SourceDataPath
-            # parameter (see csv_m.py) rather than a literal path baked into
-            # each table individually.
-            m_expression = generate_partition_m(
-                table_name, csv_filename, columns,
-                source_ref=SOURCE_DATA_PARAM_NAME, sql=_SQL_PARTITION_REFS,
+        # Table/column names and types above come entirely from Qlik's own
+        # metadata (data_model.json / data_model.converted.json) — never from
+        # a CSV — so the partition M can always be generated from them. It
+        # deliberately does NOT depend on an extracted data/<table>.csv
+        # existing: extraction no longer pulls .qvf row data at all (see
+        # qlik_extract/extractor.py), only structure. Every table's M is the
+        # parameterized CSV-folder-or-SQL query (see csv_m.py) — point
+        # SourceDataPath at wherever the real data actually lives (a CSV
+        # export you provide yourself, a network share, ...) or fill in
+        # SqlServer/SqlDatabase in Power BI Desktop's Manage Parameters to
+        # read the same table names straight from SQL instead.
+        column_names_here = {c["name"] for c in columns}
+        table_chr_concat = chr_concat_by_table.get(table_name, {})
+        table_dual_key = dual_key_by_table.get(table_name, {})
+        table_applymap = applymap_by_table.get(table_name, {})
+
+        def _spec_sources_present(spec: dict) -> bool:
+            if spec["func"] == "ConcatKey":
+                # field_a/field_b are trusted from the regex match against
+                # the script itself, NOT required to already be in this
+                # table's own declared columns — Qlik can (and here does)
+                # consume a field purely to build a computed one without
+                # ever exposing it as an output field of the table (see
+                # csv_m.py's _extra_helper_columns, which selects them from
+                # the source file as scratch inputs regardless).
+                return True
+            if spec["func"] == "ApplyMapSubfield":
+                # Resolve the map it references against the mapping tables
+                # actually found in the script, filling in the key/value
+                # field names and source filename _computed_column_expr /
+                # csv_m._mapping_dict_statement need — a map name that
+                # doesn't match any `mapping LOAD` block found is left
+                # unresolved (falls through to the normal "loads blank"
+                # behavior) rather than guessed at.
+                mapping = mapping_tables.get(spec["map_name"].casefold())
+                if not mapping or spec["source"] not in column_names_here:
+                    return False
+                map_filenames = source_files_by_table.get(mapping["table_label"])
+                if not map_filenames:
+                    return False
+                spec["map_key_field"] = mapping["key_field"]
+                spec["map_value_field"] = mapping["value_field"]
+                spec["map_filename"] = map_filenames[0]
+                return True
+            return spec["source"] in column_names_here
+
+        computed = {}
+        for c in columns:
+            spec = (
+                month_derived.get(c["name"].casefold())
+                or table_chr_concat.get(c["name"].casefold())
+                or table_dual_key.get(c["name"].casefold())
+                or table_applymap.get(c["name"].casefold())
+            )
+            if spec and _spec_sources_present(spec):
+                computed[c["name"]] = spec
+        if computed:
+            def _describe(s):
+                if s["func"] == "ChrConcat":
+                    return f'Chr({s["code"]}) & {s["source"]}' if s["prefix"] else f'{s["source"]} & Chr({s["code"]})'
+                if s["func"] == "ApplyMapSubfield":
+                    return f'SubField(ApplyMap(\'{s["map_name"]}\', {s["source"]}, \'{s["default"]}\'), \'{s["sep"]}\', {s["part_index"] + 1})'
+                if s["func"] == "ConcatKey":
+                    return f'{s["field_a"]} & "{s["sep"]}" & {s["field_b"]}'
+                return f"{s['func']}({s['source']})"
+            names = ", ".join(f"{n} = {_describe(s)}" for n, s in computed.items())
+            print(f"[build] {table_name}: computing {names} in Power Query (per the Qlik LOAD script) "
+                  f"instead of reading them from the CSV — they were never in the source file either")
+
+        # A field Qlik's own script renames (`RiskBand AS PredictedRiskBand`)
+        # is genuinely absent from a raw source file under its NEW name — the
+        # file only ever had "RiskBand" — so Table.SelectColumns by the
+        # model's name alone would load it as null even though the data is
+        # right there under its other name. {target: source} tells the M
+        # generator which raw column to actually pull, then rename.
+        renames = {}
+        for c in columns:
+            if c["name"] in computed:
+                continue
+            source_name = renamed_by_table.get(table_name, {}).get(c["name"].casefold())
+            if source_name:
+                renames[c["name"]] = source_name
+        if renames:
+            print(f"[build] {table_name}: {', '.join(f'{s} -> {t}' for t, s in renames.items())} "
+                  f"(per the Qlik LOAD script's own AS-rename — selecting by the source file's original "
+                  f"name, then renaming, instead of expecting the file to already use the new name)")
+
+        if table_name in inline_tables:
+            # LOAD * INLINE [...] — literal rows typed straight into the
+            # script, no source file at all. Embed them in the M directly
+            # (see csv_m.generate_inline_partition_m) instead of expecting
+            # a "{table}.csv" that was never going to exist ("Could not
+            # find file").
+            print(f"[build] {table_name}: LOAD ... INLINE in the Qlik script (no source file) — "
+                  f"embedding its {len(inline_tables[table_name])} row(s) directly in the M instead of "
+                  f"expecting a CSV file for it")
+            tables[table_name] = {
+                "columns": columns,
+                "m_expression": generate_inline_partition_m(columns, inline_tables[table_name]),
+                "computed": {}, "renames": {}, "multi_source_files": None, "csv_filename": None,
+                "inline_rows": inline_tables[table_name],
+            }
+            continue
+
+        # A `left join(Table) LOAD ... RESIDENT Other ... GROUP BY ...`
+        # column (see _detect_join_resident_aggregations) has no source
+        # file of its own — exclude it from what the base load selects
+        # from CSV/SQL (it would just load null and collide with the
+        # joined-in value added below), same idea as `computed`.
+        join_spec = join_agg_by_table.get(table_name)
+        join_agg_aliases = {a["alias"] for a in join_spec["aggregations"]} if join_spec else set()
+        base_columns = [c for c in columns if c["name"] not in join_agg_aliases]
+
+        # Use the script's own FROM filename(s) whenever they were found —
+        # NEVER assume the source file is named after the table. Only fall
+        # back to guessing "{table}.csv" when the script parse found no
+        # FROM clause at all for this table (e.g. it's RESIDENT/INLINE-only
+        # and genuinely has no file of its own).
+        detected_files = source_files_by_table.get(table_name)
+        multi_source_files = detected_files if detected_files and len(detected_files) > 1 else None
+        csv_filename = None
+        if multi_source_files:
+            print(f"[build] {table_name}: built from {len(multi_source_files)} source files in the Qlik "
+                  f"script, in this order — {', '.join(multi_source_files)} — combining all of them "
+                  f"(Table.Combine) instead of loading only the first")
+            m_expression = generate_combined_partition_m(
+                table_name, multi_source_files, base_columns,
+                source_ref=SOURCE_DATA_PARAM_NAME, sql=_SQL_PARTITION_REFS, computed=computed, renames=renames,
             )
         else:
-            m_path = os.path.join(converted_dir, f"m_query__{_safe(table_name)}.m")
-            m_expression = ""
-            if os.path.exists(m_path):
-                with open(m_path, encoding="utf-8") as f:
-                    m_expression = f.read()
-        tables[table_name] = {"columns": columns, "m_expression": m_expression}
+            csv_filename = detected_files[0] if detected_files else f"{_safe(table_name)}.csv"
+            if detected_files and csv_filename.casefold() != f"{_safe(table_name)}.csv".casefold():
+                print(f"[build] {table_name}: source file is '{csv_filename}' per the Qlik script "
+                      f"(not '{_safe(table_name)}.csv')")
+            m_expression = generate_partition_m(
+                table_name, csv_filename, base_columns,
+                source_ref=SOURCE_DATA_PARAM_NAME, sql=_SQL_PARTITION_REFS, computed=computed, renames=renames,
+            )
+
+        if join_spec:
+            print(f"[build] {table_name}: joining {', '.join(sorted(join_agg_aliases))} from a "
+                  f"RESIDENT {join_spec['source_table']} GROUP BY aggregate (per the Qlik script's own "
+                  f"LEFT JOIN) — grouping {join_spec['source_table']}'s own query and merging it on "
+                  f"{', '.join(g['alias'] for g in join_spec['group_by'])} instead of leaving "
+                  f"{', '.join(sorted(join_agg_aliases))} blank")
+            m_expression = wrap_with_left_join_aggregation(m_expression, join_spec)
+
+        tables[table_name] = {
+            "columns": columns, "m_expression": m_expression, "computed": computed, "renames": renames,
+            "multi_source_files": multi_source_files, "csv_filename": csv_filename, "join_spec": join_spec,
+        }
 
     measures_by_table: dict[str, list[dict]] = {name: [] for name in tables}
     # Tabular measure names are matched case-insensitively, and the visual
@@ -546,7 +1330,8 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
             })
             original_measure_table[item["name"].casefold()] = (table, item["name"])
 
-    return tables, measures_by_table, calc_cols_by_table, hierarchies_by_table, original_measure_table
+    return (tables, measures_by_table, calc_cols_by_table, hierarchies_by_table, original_measure_table,
+            required_relationship_orientations)
 
 
 # Aggregators that HARD-ERROR in DAX on a text column (unlike MIN/MAX/COUNT,
@@ -687,15 +1472,159 @@ def _reconcile_column_types(
         table = tables.get(tname)
         if not table or table.get("is_calculated"):
             continue
-        csv_path = os.path.join(data_dir, f"{_safe(tname)}.csv")
-        if os.path.exists(csv_path) and SOURCE_DATA_PARAM_NAME in table.get("m_expression", ""):
-            table["m_expression"] = generate_partition_m(
-                tname, os.path.basename(csv_path), table["columns"],
-                source_ref=SOURCE_DATA_PARAM_NAME, sql=_SQL_PARTITION_REFS,
-            )
+        # No dependency on an extracted CSV existing (extraction never
+        # creates one) — regenerate from the table's own (now-corrected)
+        # column list, same as the initial generation in
+        # _assemble_semantic_inputs above.
+        if table.get("inline_rows") is not None:
+            table["m_expression"] = generate_inline_partition_m(table["columns"], table["inline_rows"])
+        elif SOURCE_DATA_PARAM_NAME in table.get("m_expression", ""):
+            join_spec = table.get("join_spec")
+            join_agg_aliases = {a["alias"] for a in join_spec["aggregations"]} if join_spec else set()
+            base_columns = [c for c in table["columns"] if c["name"] not in join_agg_aliases]
+            multi_source_files = table.get("multi_source_files")
+            if multi_source_files:
+                m_expression = generate_combined_partition_m(
+                    tname, multi_source_files, base_columns,
+                    source_ref=SOURCE_DATA_PARAM_NAME, sql=_SQL_PARTITION_REFS,
+                    computed=table.get("computed"), renames=table.get("renames"),
+                )
+            else:
+                m_expression = generate_partition_m(
+                    tname, table.get("csv_filename") or f"{_safe(tname)}.csv", base_columns,
+                    source_ref=SOURCE_DATA_PARAM_NAME, sql=_SQL_PARTITION_REFS,
+                    computed=table.get("computed"), renames=table.get("renames"),
+                )
+            if join_spec:
+                m_expression = wrap_with_left_join_aggregation(m_expression, join_spec)
+            table["m_expression"] = m_expression
 
 
 _TABLE_QUALIFIED_REF_RE = re.compile(r"(?:'([^']+)'|(\b[A-Za-z_]\w*\b))\[([^\[\]]+)\]")
+
+def _dax_protected_spans(expr: str) -> list[tuple[int, int]]:
+    """Every `[...]` column/measure reference, `"..."` string literal, and
+    `'...'` quoted table name in a DAX expression, as (start, end) spans —
+    a single left-to-right scan rather than one regex per bracket style, so
+    it can't miss a combination (a measure name matching text inside ANY of
+    these was found to corrupt real DAX in practice: inside an existing
+    `[Multi Word Measure]`, inside a `"string literal"`, and inside a
+    `'Quoted Table Name'` — three different delimiters, same underlying
+    mistake of only checking the single character immediately before a
+    candidate match instead of "is this position inside a span at all").
+    `''`/`""` doubled-quote escaping is honored so an embedded quote doesn't
+    end the span early."""
+    spans, i, n = [], 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch == "[":
+            j = expr.find("]", i + 1)
+            if j == -1:
+                break
+            spans.append((i, j + 1))
+            i = j + 1
+        elif ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if expr[j] == ch:
+                    if j + 1 < n and expr[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            spans.append((i, min(j + 1, n)))
+            i = j + 1
+        else:
+            i += 1
+    return spans
+
+
+def _wrap_bare_measure_refs(
+    measures_by_table: dict[str, list[dict]],
+    calc_cols_by_table: dict[str, list[dict]],
+    original_measure_table: dict[str, tuple[str, str]],
+) -> None:
+    """A DAX measure reference is only valid in square brackets — `[Name]`,
+    not bare `Name` — but the LLM occasionally writes the bracket-less form
+    (seen: `PredictARFact[PredictedCollectionWeek] - vDunningShift -
+    vEarlyPaymentDiscountPct`, missing brackets on both variables, while 4
+    other measures in the same app reference the very same names correctly
+    with brackets). Power BI's response to the bare form is a hard
+    calculation error — "Failed to resolve name '<X>'. It is not a valid
+    table, variable, or function name." — which can also cascade into
+    unrelated-looking errors on other measures that read the same table via
+    RELATED(), since a table with a calculation error effectively has no
+    usable rows.
+
+    Deterministic and narrowly scoped to genuinely bare occurrences: any
+    text already inside an existing `[...]` span (found first, kept intact)
+    is never touched even if a measure name happens to be a substring of
+    what's in there — e.g. `[TOUR ADHERENCE]` must be left exactly as-is,
+    not partly reprocessed just because a DIFFERENT, separately-registered
+    measure happens to be named plain "Adherence". Measure names are tried
+    longest-first so a bare multi-word name matches as one whole phrase
+    rather than tripping on a shorter name that happens to be one of its
+    words. The same protection covers `"..."` string literals and `'...'`
+    quoted table names — a real measure named "Visited" once matched the
+    word "Visited" inside `Fact_Sales[Status] = "Visited"` (an ordinary text
+    comparison, nothing to do with the measure) and corrupted it into
+    `"[Visited]"`, silently breaking that comparison against real data with
+    no error anywhere; a measure named "Achievement %" similarly matched
+    inside the quoted table name `'Sales Achievement %'`, corrupting it to
+    `'Sales [Achievement %]'`."""
+    # A "measure name" with no letters at all (seen: a constant-placeholder
+    # measure literally named "1") is indistinguishable from an ordinary
+    # numeric literal appearing anywhere else in any DAX expression — trying
+    # to auto-bracket it would turn every bare "1" in the model (any
+    # addition, any MAX(0, ...), any IF(...,1,0)) into a self-referencing
+    # `[1]`. Skip anything that can't be told apart from plain DAX syntax
+    # this way; a genuine bare reference to a number-only-named measure has
+    # to be fixed by hand, but that's far safer than corrupting every
+    # numeric literal in the model.
+    names = sorted(
+        {v[1] for v in original_measure_table.values() if re.search(r"[A-Za-z]", v[1])},
+        key=len, reverse=True,
+    )
+    if not names:
+        return
+    bare_name_re = re.compile(
+        r"(?<![\[\w'])(" + "|".join(re.escape(n) for n in names) + r")(?![\]\w])", re.IGNORECASE,
+    )
+
+    def fix(expr: str) -> str:
+        if not expr:
+            return expr
+        protected_spans = _dax_protected_spans(expr)
+        def is_protected(pos: int) -> bool:
+            return any(start <= pos < end for start, end in protected_spans)
+        pieces, cursor = [], 0
+        for m in bare_name_re.finditer(expr):
+            if is_protected(m.start()):
+                continue
+            found = original_measure_table.get(m.group(1).casefold())
+            real_name = found[1] if found else m.group(1)
+            pieces.append(expr[cursor:m.start()])
+            pieces.append(f"[{real_name}]")
+            cursor = m.end()
+        if not pieces:
+            return expr
+        pieces.append(expr[cursor:])
+        return "".join(pieces)
+
+    for ms in measures_by_table.values():
+        for mrow in ms:
+            fixed = fix(mrow.get("expression", ""))
+            if fixed != mrow.get("expression", ""):
+                print(f"[build] wrapped bare measure reference(s) in '{mrow['name']}' with [] "
+                      f"(DAX requires brackets around a measure name; the LLM wrote it bare)")
+            mrow["expression"] = fixed
+    for cs in calc_cols_by_table.values():
+        for crow in cs:
+            fixed = fix(crow.get("expression", ""))
+            if fixed != crow.get("expression", ""):
+                print(f"[build] wrapped bare measure reference(s) in calculated column '{crow['name']}' with [] "
+                      f"(DAX requires brackets around a measure name; the LLM wrote it bare)")
+            crow["expression"] = fixed
 
 
 def _fix_measure_self_references(
@@ -1152,9 +2081,61 @@ def _synthesize_adhoc_measures(
         elif isinstance(node, list):
             for v in node:
                 _walk(v)
-
     for page in pages:
-        _walk(page)
+        for visual in page.get("visuals", []):
+            _walk(visual)
+
+
+_PLACEHOLDER_CONST_RE = re.compile(
+    r"=?\s*Sum\(\s*(-?\d+(?:\.\d+)?)\s*\)|value\s*=\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE,
+)
+
+
+def _collect_measure_properties(node, out: set[str]) -> None:
+    """Every `Measure`/`Column` Property name referenced anywhere inside one
+    visual — Property may already be hoisted to its canonical sibling
+    position or still nested in Expression (this runs before
+    _normalize_field_node_shapes), so check both."""
+    if isinstance(node, dict):
+        for key in ("Measure", "Column"):
+            inner = node.get(key)
+            if isinstance(inner, dict):
+                prop = inner.get("Property") or inner.get("Expression", {}).get("Property")
+                if prop:
+                    out.add(prop)
+        for v in node.values():
+            _collect_measure_properties(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_measure_properties(v, out)
+
+
+def _synthesize_placeholder_constant_measures(
+    pages: list[dict],
+    tables: dict[str, dict],
+    measures_by_table: dict[str, list[dict]],
+    original_measure_table: dict[str, tuple[str, str]],
+) -> None:
+    fallback_table = next((t for t in tables if not tables[t].get("is_calculated")), "")
+    if not fallback_table:
+        return
+    for page in pages:
+        for visual in page.get("visuals", []):
+            m = _PLACEHOLDER_CONST_RE.search(visual.get("notes", ""))
+            if not m:
+                continue
+            value = m.group(1) or m.group(2)
+            props: set[str] = set()
+            _collect_measure_properties(visual, props)
+            for prop in props:
+                if prop.casefold() in original_measure_table:
+                    continue
+                measures_by_table.setdefault(fallback_table, []).append({
+                    "name": prop, "expression": value, "is_hidden": True,
+                })
+                original_measure_table[prop.casefold()] = (fallback_table, prop)
+                print(f"[build] synthesized constant measure '{prop}' = {value} "
+                      f"(Qlik KPI was a hard-coded Sum({value}) placeholder, per report_visuals' own notes)")
 
 
 def _normalize_label(s: str) -> str:
@@ -1431,7 +2412,24 @@ def _fix_field_and_measure_refs(
                         inner["Property"] = real_name
                         inner.setdefault("Expression", {}).setdefault("SourceRef", {})["Entity"] = entity
 
-            for v in node.values():
+            for key, v in node.items():
+                if key == "Aggregation" and isinstance(agg, dict):
+                    # Already fully resolved directly above — do NOT also
+                    # recurse into it. Aggregation.Expression is itself a
+                    # {"Column": {...}} dict, so plain recursion would hand
+                    # it to the generic `column = node.get("Column")` branch
+                    # above as if it were a top-level field binding — which
+                    # runs the measure-first check and can hijack an
+                    # explicitly-aggregated real column (e.g. a
+                    # countDistinct over InvoiceID) into a Measure reference
+                    # just because some unrelated measure's label
+                    # aggressively normalizes the same way ("Count of
+                    # InvoiceID" -> "invoiceid"). A Measure has no business
+                    # being wrapped in an Aggregation node either way, and
+                    # _entity_and_property_of_field's Aggregation case only
+                    # ever looks for a Column, so the hijacked projection
+                    # would read as unresolved and get pruned.
+                    continue
                 _walk(v, visual_id)
         elif isinstance(node, list):
             for v in node:
@@ -1445,21 +2443,80 @@ def _fix_field_and_measure_refs(
     _prune_unresolved_projections(pages)
 
 
+# PBIR's projection Aggregation node stores the aggregate as an integer
+# QueryAggregateFunction code, not a name — report_visuals instead sometimes
+# emits a plain top-level `"aggregate": "<name>"` string sibling of `field`
+# on the projection, which isn't a property PBIR's schema allows anywhere
+# ("An additional property 'aggregate' was included ..."). Map the name it
+# used to the real code so the aggregation's MEANING survives, not just so
+# the extra property goes away.
+_AGGREGATE_NAME_TO_CODE = {
+    "sum": 0, "average": 1, "avg": 1, "distinctcount": 2, "countdistinct": 2,
+    "min": 3, "max": 4, "count": 5, "median": 6, "stdev": 7, "standarddeviation": 7,
+    "variance": 8,
+}
+# Every stray-key spelling seen so far for this same mistake ("aggregate" one
+# run, "aggregation" the next) — see _normalize_field_node_shapes.
+_AGGREGATE_KEY_NAMES = ("aggregate", "aggregation", "agg", "aggFunc", "aggregateFunction")
+
+
 def _normalize_field_node_shapes(pages: list[dict]) -> None:
     """Hoist a `Property` that the LLM nested inside `Expression` (next to
     `SourceRef`) up to its canonical position as a sibling of `Expression`,
     on every Measure/Column node anywhere in the page tree. Idempotent: a
     node that already has a sibling Property is left alone (and any stray
-    nested copy removed so the two can't disagree later)."""
+    nested copy removed so the two can't disagree later).
+
+    Also converts a projection's stray sibling `"aggregate": "<name>"` (not a
+    property PBIR's schema recognizes anywhere) into the real `Aggregation`
+    wrapper around its `Column`, so e.g. "count-distinct of InvoiceID" keeps
+    working as an actual distinct-count instead of silently becoming a plain
+    (non-aggregated) column reference or being rejected outright.
+
+    Also collapses an accidentally DOUBLY-NESTED Column — a whole extra
+    `{"Column": {"Expression": {...}, "Property": ...}}` wrapped inside the
+    outer Column's own `Expression`, instead of a plain `SourceRef` there —
+    down to the innermost real `Expression`/`Property` pair. Left as-is, a
+    later resolve step's `setdefault("Expression", {})` finds the Expression
+    dict already non-empty (holding the wrong nested Column) and ADDS a
+    sibling `SourceRef` next to it rather than replacing it, leaving
+    `Expression` with two competing children — invalid PBIR ("must be
+    provided" one-of-these-properties, not more than one).
+    """
+    def _flatten_nested_column(inner: dict) -> dict:
+        while isinstance(inner.get("Expression"), dict) and isinstance(inner["Expression"].get("Column"), dict):
+            inner = inner["Expression"]["Column"]
+        return inner
+
     def walk(node):
         if isinstance(node, dict):
             for key in ("Measure", "Column"):
                 inner = node.get(key)
                 if isinstance(inner, dict):
+                    flattened = _flatten_nested_column(inner)
+                    if flattened is not inner:
+                        node[key] = inner = flattened
                     expr = inner.get("Expression")
                     if isinstance(expr, dict) and "Property" in expr:
                         inner.setdefault("Property", expr["Property"])
                         del expr["Property"]
+
+            # The LLM's own name for this stray key drifts between runs
+            # ("aggregate" one time, "aggregation" the next, plausibly
+            # others) — check every synonym rather than one literal string,
+            # so a future rename doesn't reopen this exact bug again.
+            agg_key = next((k for k in _AGGREGATE_KEY_NAMES if k in node), None)
+            if agg_key and isinstance(node.get("field"), dict):
+                agg_name = str(node.pop(agg_key)).strip().casefold()
+                column = node["field"].get("Column")
+                if isinstance(column, dict):
+                    code = _AGGREGATE_NAME_TO_CODE.get(agg_name)
+                    if code is not None:
+                        node["field"] = {"Aggregation": {"Expression": {"Column": column}, "Function": code}}
+                    else:
+                        print(f"[build] WARNING: dropping unrecognized projection aggregate '{agg_name}' "
+                              f"(queryRef='{node.get('queryRef')}') — binding as a plain column instead")
+
             for v in node.values():
                 walk(v)
         elif isinstance(node, list):
@@ -1554,6 +2611,52 @@ def _prune_unresolved_projections(pages: list[dict]) -> None:
                 value["projections"] = kept
 
 
+def _visual_has_system_field(visual: dict) -> bool:
+    """True if any projection in this visual's queryState binds a Qlik
+    SYSTEM field — $Table, $Field, $Rows, $Info, $Occurrence, and the like
+    (Qlik's own built-in introspection fields, exposed by things like its
+    "Data Model Viewer" sheet). These describe the Qlik app's OWN metadata,
+    not real data, so no equivalent table/column exists (or ever will) in
+    the Power BI model to bind them to — report_visuals recognizes them as
+    such in its own notes but still points the binding at a fabricated
+    table (seen: "Model"), which Power BI reports as fields that need
+    fixing. Scans for a `"Property"` value anywhere in the query state
+    (rather than assuming one particular field-node shape) since this runs
+    before the shape normalizer that would otherwise standardize it."""
+    query_state = visual.get("visual", {}).get("query", {}).get("queryState", {})
+    def scan(node):
+        if isinstance(node, dict):
+            prop = node.get("Property")
+            if isinstance(prop, str) and prop.startswith("$"):
+                return True
+            return any(scan(v) for v in node.values())
+        if isinstance(node, list):
+            return any(scan(v) for v in node)
+        return False
+    return scan(query_state)
+
+
+def _replace_system_field_visuals(pages: list[dict]) -> None:
+    for page in pages:
+        for visual in page.get("visuals", []):
+            if not _visual_has_system_field(visual):
+                continue
+            old_type = visual.get("visual", {}).get("visualType", "visual")
+            print(f"[build] '{visual.get('name', '?')}' ({old_type}) is bound to a Qlik system field "
+                  f"($Table/$Rows/etc. — Qlik's own app introspection data, not real fields) — replacing "
+                  f"with a placeholder textbox, the same fallback used for any other Qlik object Power BI "
+                  f"has no way to reproduce")
+            visual["visual"] = {
+                "visualType": "textbox",
+                "objects": {
+                    "general": [{"properties": {"paragraphs": [{"textRuns": [{
+                        "value": "Qlik system-field visual (e.g. its Data Model Viewer) — "
+                                 "not reproducible as bound data in Power BI"
+                    }]}]}}]
+                },
+            }
+
+
 def _load_pages(converted_dir: str) -> list[dict]:
     pages = []
     for path in sorted(glob.glob(os.path.join(converted_dir, "page__*.json"))):
@@ -1625,13 +2728,36 @@ def _sanitize_visual_shapes(pages: list[dict]) -> None:
                 ):
                     visual_obj.pop("query", None)
 
+            # PBIR: a textbox's rich text belongs at
+            # objects.general[0].properties.paragraphs[...], not as its own
+            # top-level objects.paragraphs object — report_visuals instead
+            # emits `objects: {"paragraphs": [{"text": "..."}]}`, which is
+            # both the wrong location AND missing the "properties" wrapper
+            # every PBIR object instance requires ("Required property
+            # 'properties' was not included" / "An additional property
+            # 'text' was included"). Relocate it to the real shape instead
+            # of leaving objects.paragraphs behind.
+            objects = visual_obj.get("objects")
+            if isinstance(objects, dict):
+                bad_paragraphs = objects.pop("paragraphs", None)
+                if isinstance(bad_paragraphs, list):
+                    text_runs = [
+                        {"textRuns": [{"value": str(p["text"])}]}
+                        for p in bad_paragraphs
+                        if isinstance(p, dict) and "text" in p
+                    ]
+                    if text_runs:
+                        general = objects.setdefault("general", [])
+                        if not general or not isinstance(general[0], dict):
+                            general.insert(0, {"properties": {}})
+                        general[0].setdefault("properties", {})["paragraphs"] = text_runs
+
             # PBIR: every `visual.objects.<name>` value must be a LIST of
             # {"properties": {...}} entries (real visual.json: "objects":
             # {"title": [{"properties": {...}}]}). report_visuals sometimes
             # emits a bare dict for one (seen: `general`, `text`) —
             # "Property /visual/objects/<name> was not provided as the
             # correct type". Coerce to the list shape.
-            objects = visual_obj.get("objects")
             if isinstance(objects, dict):
                 for key, val in list(objects.items()):
                     if isinstance(val, list):
@@ -1737,6 +2863,70 @@ def _write_pbip_file(project_dir: str, app_name: str) -> None:
     }
     with open(os.path.join(project_dir, f"{app_name}.pbip"), "w", encoding="utf-8") as f:
         json.dump(pbip, f, indent=2)
+
+
+def _orient_relationships_for_related(
+    relationships: list[dict], required_orientations: list[tuple[str, str]],
+) -> list[dict]:
+    """Flip a relationship's from/to (many/one) direction when a calculated
+    table's own DAX needs it the other way — see the
+    required_relationship_orientations comment in _assemble_semantic_inputs.
+    `(many_table, one_table)`: if an existing relationship connects the same
+    two tables but with the direction reversed, swap its from/to so the
+    "many" side really is the from_table (TMDL's implicit default then
+    renders RELATED()'s required direction correctly, with no cardinality
+    override needed)."""
+    for many_table, one_table in required_orientations:
+        for rel in relationships:
+            if rel["from_table"] == one_table and rel["to_table"] == many_table:
+                rel["from_table"], rel["to_table"] = rel["to_table"], rel["from_table"]
+                rel["from_column"], rel["to_column"] = rel["to_column"], rel["from_column"]
+                print(f"[build] reoriented relationship {one_table}<->{many_table} to {many_table} (many) -> "
+                      f"{one_table} (one) — a calculated table's own DAX needs RELATED({one_table}[...]) while "
+                      f"iterating {many_table}, which requires {many_table} to be the many side regardless of "
+                      f"which table looks more \"fact-like\" for the model's other relationships")
+                break
+    return relationships
+
+
+def _drop_relationships_into_related_calc_tables(relationships: list[dict], tables: dict[str, dict]) -> list[dict]:
+    """A statically-declared TMDL relationship pointing at (or from) a DAX
+    calculated table's column fails Power BI Desktop's static, pre-refresh
+    project-load validation — "Relationship '<guid>' uses an invalid column
+    ID <n>" — REGARDLESS of cardinality/crossFilter settings and regardless
+    of whether the calculated table's own expression depends on another
+    relationship (RELATED()) or is fully self-contained (a plain
+    CALENDARAUTO() calendar table hits this exactly the same way — a
+    calculated table's columns simply don't exist yet at the point Desktop
+    validates the static relationship list, whatever the DAX behind them).
+    Confirmed across two different apps/tables (DisputeCount90d, which uses
+    RELATED(); MasterCalendar, which doesn't) before landing on this as the
+    real, general rule rather than the narrower RELATED()-only guess this
+    function started as.
+
+    Dropping the relationship here doesn't lose the connection permanently —
+    it just can't be pre-declared in the static TMDL. Add it by hand in
+    Power BI Desktop's Model view (drag the key column across) once the
+    project is open, at which point the calculated table's schema already
+    exists and Desktop resolves it correctly."""
+    risky_tables = {name for name, t in tables.items() if t.get("is_calculated")}
+    if not risky_tables:
+        return relationships
+    kept, dropped = [], []
+    for rel in relationships:
+        if rel["from_table"] in risky_tables or rel["to_table"] in risky_tables:
+            dropped.append(rel)
+        else:
+            kept.append(rel)
+    for rel in dropped:
+        calc_side = rel['from_table'] if rel['from_table'] in risky_tables else rel['to_table']
+        print(f"[build] NOTE: not declaring the relationship {rel['from_table']}[{rel['from_column']}] <-> "
+              f"{rel['to_table']}[{rel['to_column']}] in TMDL — one side ('{calc_side}') is a DAX calculated "
+              f"table, and Power BI Desktop's static project-load validation can't resolve a relationship "
+              f"into one ('uses an invalid column ID'), regardless of cardinality or what the calculated "
+              f"table's own expression does. Add it by hand in Model view after opening the .pbip — Desktop "
+              f"creates it correctly once the calculated table's schema exists.")
+    return kept
 
 
 def _merge_relationships(llm_relationships: list[dict], inferred_relationships: list[dict]) -> list[dict]:

@@ -4,10 +4,13 @@ JSON/text file under extracted/<app_name>/."""
 
 from __future__ import annotations
 
-import csv
 import json
 import os
+import re
+import time
 from typing import Any
+
+from app.config.settings import settings
 
 from .client import QlikCloudClient, EngineSession
 from .section_access import parse_section_access
@@ -16,9 +19,18 @@ HYPERCUBE_MAX_CELLS_PER_PAGE = 8_000   # Qlik Cloud tenants cap qHeight*qWidth p
 HYPERCUBE_MIN_PAGE_HEIGHT = 1
 MAX_ROWS_PER_TABLE = 500_000  # safety cap so a runaway table can't hang extraction
 
+# _reload_doc() is what actually populates GetTablesAndKeys for a freshly
+# imported app (see its docstring) — this retry is just a backstop for the
+# rarer case where DoReload reports success but the engine takes a moment
+# to reflect it, so a real problem still fails loudly instead of silently
+# writing an empty data_model.json that later collapses the whole build
+# down to just synthetic (e.g. what-if slider) tables.
+_DATA_MODEL_RETRY_ATTEMPTS = 5
+_DATA_MODEL_RETRY_DELAY_SECONDS = 3
+
 _PAGE_TOO_LARGE_CODE = 6001
 
-EXTRACTED_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "extracted")
+EXTRACTED_ROOT = str(settings.project_root / "extracted")
 
 
 def extract_app(
@@ -48,11 +60,12 @@ def extract_app(
     try:
         with client.open_engine_session(app_id) as session:
             session.open_doc(app_id)
+            _reload_doc(session)
 
             script = _get_script(session)
             _write_text(out_dir, "script.qvs", script)
 
-            data_model = _get_data_model(session)
+            data_model = _get_data_model_with_retry(session, script)
             _write_json(out_dir, "data_model.json", data_model)
 
             measures = _get_measures(session)
@@ -70,12 +83,12 @@ def extract_app(
             section_access = parse_section_access(script)
             _write_json(out_dir, "section_access.json", section_access)
 
-            data_dir = os.path.join(out_dir, "data")
-            os.makedirs(data_dir, exist_ok=True)
-            for table in data_model.get("tables", []):
-                _export_table_data(session, table, data_dir)
-
-            kpi_containers = _detect_kpi_metadata_tables(data_model, data_dir)
+            # NOTE: .qvf row/record data is intentionally NOT extracted and no
+            # data/*.csv files are written here (see _fetch_table_rows below
+            # for the one narrow exception: a KPI-container config table's
+            # own small set of rows, which are object/sheet metadata, not
+            # business data, and are kept in memory only).
+            kpi_containers = _detect_kpi_metadata_tables(session, data_model)
             _write_json(out_dir, "kpi_containers.json", kpi_containers)
             if kpi_containers:
                 names = ", ".join(k["table"] for k in kpi_containers)
@@ -102,6 +115,36 @@ def _get_script(session: EngineSession) -> str:
     return result.get("qScript", "")
 
 
+def _reload_doc(session: EngineSession) -> None:
+    """A .qvf imported via the REST /apps/import endpoint arrives with its
+    script and layout, but Qlik Cloud does NOT pre-populate the associative
+    engine's table/field data from the file's own embedded state — that
+    only happens once this session actually reloads it (confirmed directly:
+    GetTablesAndKeys returns 0 tables before DoReload and every real table
+    immediately after, even for a script that never touches data.qvf's own
+    prior computed state). This runs unconditionally for every app, not
+    just ones known to need it, since there's no reliable way to tell
+    upfront whether an imported app already has a queryable model.
+
+    A reload failing here (e.g. a lib:// connection this tenant hasn't
+    registered) is not fatal on its own — GetScript/sheets/measures don't
+    need it — so this only warns; _get_data_model_with_retry is what turns
+    "reload didn't produce any tables" into a hard, actionable failure.
+    """
+    print("[extract] reloading app in Qlik Cloud so its data model is queryable...")
+    try:
+        result = session.doc_call("DoReload", [0, False, False])
+    except Exception as exc:
+        print(f"[extract] WARNING: reload raised an error: {exc}")
+        return
+    if result.get("qReturn") is not True:
+        print(
+            "[extract] WARNING: reload did not report success — the script's data "
+            "connections may not resolve in this tenant. Continuing anyway; the "
+            "data model may end up empty or partial."
+        )
+
+
 def _get_data_model(session: EngineSession) -> dict:
     """Tables, fields and their associations (keys)."""
     result = session.doc_call("GetTablesAndKeys", [
@@ -113,29 +156,62 @@ def _get_data_model(session: EngineSession) -> dict:
     }
 
 
-def _export_table_data(session: EngineSession, table: dict, data_dir: str) -> None:
-    """Export one table's actual rows (not just schema) so the compiled .pbix
-    loads real data instead of pointing at a source file/DB only the Qlik
-    author's machine could reach.
+def _get_data_model_with_retry(session: EngineSession, script: str) -> dict:
+    data_model = _get_data_model(session)
+    if data_model.get("tables"):
+        return data_model
+
+    if not re.search(r"\bLOAD\b", script, re.IGNORECASE):
+        return data_model  # the script genuinely has no LOAD statements - 0 tables is correct
+
+    for attempt in range(1, _DATA_MODEL_RETRY_ATTEMPTS + 1):
+        print(
+            f"[extract] WARNING: GetTablesAndKeys returned 0 tables after reload, "
+            f"but the script clearly has LOAD statements - retrying "
+            f"({attempt}/{_DATA_MODEL_RETRY_ATTEMPTS})..."
+        )
+        time.sleep(_DATA_MODEL_RETRY_DELAY_SECONDS)
+        data_model = _get_data_model(session)
+        if data_model.get("tables"):
+            return data_model
+
+    raise RuntimeError(
+        "Qlik Engine API's GetTablesAndKeys kept returning 0 tables even "
+        "after reloading the app and the app's own load script defines "
+        f"tables, after {_DATA_MODEL_RETRY_ATTEMPTS} retries. The reload "
+        "likely failed (check the WARNING printed right after 'reloading "
+        "app in Qlik Cloud...' above) — most often because a lib:// data "
+        "connection the script references isn't registered in this Qlik "
+        "Cloud tenant. Fix/register that connection (or point the script "
+        "at one that exists) and re-run extract."
+    )
+
+
+def _fetch_table_rows(session: EngineSession, table: dict) -> list[dict]:
+    """Fetch one table's rows directly via the Engine, kept in MEMORY ONLY —
+    never written to a CSV file or any other file on disk. This is used for
+    exactly one purpose (see _detect_kpi_metadata_tables below): reading a
+    small KPI-container config table's own rows (a title/measure-ref/color
+    per KPI tile), which is object/sheet metadata recovery, not business-data
+    extraction. It is NOT used for ordinary fact/dimension tables — no
+    .qvf row/record data is extracted or persisted for those.
 
     Uses a straight (non-aggregated) hypercube with every field of the table
     as a dimension PLUS a synthetic '=RecNo()' dimension. RecNo() is the
     table's own internal record number, so it's guaranteed unique per row —
     without it, a straight hypercube behaves like a GROUP BY over every
     listed field and silently collapses any two rows that happen to share
-    identical values across all fields (very possible on a table built from
-    Table.Combine()-ing several sparse/mostly-null sub-tables, or on
-    low-cardinality sample data), quietly under-counting SUM()s downstream.
+    identical values across all fields.
     """
     table_name = table.get("qName") or table.get("name")
     fields = table.get("qFields", table.get("fields", []))
     field_names = [f.get("qName") or f.get("name") for f in fields if f.get("qName") or f.get("name")]
     if not table_name or not field_names:
-        return
+        return []
 
-    # Dates are exported as their raw Qlik serial-day number (not formatted
-    # text) so M can reconstruct the calendar date deterministically instead
-    # of guessing a locale for a formatted string like "01/02/2026".
+    # Dates are read as their raw Qlik serial-day number (not formatted text)
+    # so downstream code can reconstruct the calendar date deterministically
+    # instead of guessing a locale for a formatted string like "01/02/2026".
     use_raw_number = [_field_is_numeric(f) or _field_is_date(f) for f in fields if f.get("qName") or f.get("name")]
 
     width = len(field_names) + 1  # +1 for the trailing RecNo() distinctness column
@@ -158,8 +234,8 @@ def _export_table_data(session: EngineSession, table: dict, data_dir: str) -> No
     try:
         handle, layout, height = _create_with_shrink(session, obj_def, height, width)
     except Exception as exc:
-        print(f"[extract] WARNING: could not export data for table '{table_name}': {exc}")
-        return
+        print(f"[extract] WARNING: could not read rows for table '{table_name}': {exc}")
+        return []
 
     hc = layout.get("qHyperCube", {})
     total_rows = hc.get("qSize", {}).get("qcy", 0)
@@ -180,42 +256,21 @@ def _export_table_data(session: EngineSession, table: dict, data_dir: str) -> No
     # result on engines that accept it — Qlik Cloud silently DROPS an inline
     # `=RecNo()` dimension from a qMode "S" hypercube, so every row comes back
     # with exactly n_fields cells and no distinctness column. Blindly doing
-    # `row[:-1]` in that case chops off the real LAST field of every table
-    # (then the short-row padding re-adds a trailing null), which silently
-    # nulled out the last column of every extracted table. Decide from the
-    # actual returned cell count, not from what we requested.
+    # `row[:-1]` in that case would chop off the real LAST field of every
+    # row. Decide from the actual returned cell count, not from what was
+    # requested.
     returned_width = len(rows[0]) if rows else hc.get("qSize", {}).get("qcx", width)
     has_distinctness_col = returned_width > n_fields
-    if not has_distinctness_col and total_rows:
-        print(f"[extract] NOTE: {table_name}: engine did not return the =RecNo() distinctness "
-              f"column ({returned_width} cols for {n_fields} fields) — keeping all columns; "
-              f"row-collapse protection is off, so identical rows across every field could merge")
 
-    csv_path = os.path.join(data_dir, f"{_safe_filename(table_name)}.csv")
-    short_rows = 0
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(field_names)
-        for row in rows:
-            data_cells = list(row[:-1]) if has_distinctness_col else list(row)
-            if len(data_cells) < n_fields:
-                # Qlik occasionally returns fewer cells than requested for a
-                # row (seen with dual-valued derived fields like
-                # MonthName()). Silently zipping a short row against
-                # use_raw_number/field_names would shift every later column
-                # by one — pad with nulls instead so column alignment stays
-                # correct (only the missing field is blank for that row).
-                short_rows += 1
-                data_cells = data_cells + [{"qIsNull": True}] * (n_fields - len(data_cells))
-            elif len(data_cells) > n_fields:
-                data_cells = data_cells[:n_fields]
-            writer.writerow([_cell_value(cell, raw) for cell, raw in zip(data_cells, use_raw_number)])
-
-    if short_rows:
-        print(f"[extract] WARNING: {table_name}: {short_rows} row(s) returned fewer cells than "
-              f"requested by the Engine API — padded with nulls to keep columns aligned; "
-              f"check for a dual-valued/derived field (e.g. MonthName()-style) losing data")
-    print(f"[extract] {table_name}: exported {len(rows)} row(s) -> data/{os.path.basename(csv_path)}")
+    out = []
+    for row in rows:
+        data_cells = list(row[:-1]) if has_distinctness_col else list(row)
+        if len(data_cells) < n_fields:
+            data_cells = data_cells + [{"qIsNull": True}] * (n_fields - len(data_cells))
+        elif len(data_cells) > n_fields:
+            data_cells = data_cells[:n_fields]
+        out.append({name: _cell_value(cell, raw) for name, cell, raw in zip(field_names, data_cells, use_raw_number)})
+    return out
 
 
 def _is_page_too_large(exc: Exception) -> bool:
@@ -253,7 +308,7 @@ def _fetch_page_with_shrink(session: EngineSession, handle: int, top: int, heigh
             print(f"[extract] page too large, retrying with qHeight={height}")
 
 
-def _detect_kpi_metadata_tables(data_model: dict, data_dir: str) -> list[dict]:
+def _detect_kpi_metadata_tables(session: EngineSession, data_model: dict) -> list[dict]:
     """Detect a Qlik 'KPI container' driver table: a config table where each
     row describes one KPI tile (a title, a measure reference like
     '[Achievement %]', a background color, ...) rendered by a generic KPI
@@ -261,8 +316,10 @@ def _detect_kpi_metadata_tables(data_model: dict, data_dir: str) -> list[dict]:
     container reads this table at runtime rather than exposing each KPI as
     its own object, the normal per-sheet-object extraction never sees these
     as separate KPIs — recovering them means reading the config table's own
-    rows directly (already exported to CSV) and matching them back to real
-    measures during conversion.
+    rows directly (via _fetch_table_rows, in memory only — never written to
+    a CSV file) and matching them back to real measures during conversion.
+    This is object/sheet metadata recovery (which KPI tiles exist), not
+    business-data extraction.
 
     Heuristic: a table with at least one field whose name contains "title"
     and at least one whose name contains "measure" (case-insensitive) is
@@ -282,12 +339,7 @@ def _detect_kpi_metadata_tables(data_model: dict, data_dir: str) -> list[dict]:
         if not (has_title and has_measure):
             continue
 
-        csv_path = os.path.join(data_dir, f"{_safe_filename(table_name)}.csv")
-        if not os.path.exists(csv_path):
-            continue
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.DictReader(f))
-
+        rows = _fetch_table_rows(session, table)
         detected.append({"table": table_name, "fields": fields, "rows": rows})
     return detected
 
@@ -321,8 +373,6 @@ def _cell_value(cell: dict, raw_number: bool):
     return cell.get("qText", "")
 
 
-def _safe_filename(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "_-." else "_" for c in name)
 
 
 def _get_measures(session: EngineSession) -> list[dict]:
