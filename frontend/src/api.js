@@ -8,14 +8,44 @@ async function asJson(res) {
   return data;
 }
 
+function post(path) {
+  return fetch(`${API}${path}`, { method: "POST" }).then(asJson);
+}
+
 export function uploadQvf(file) {
   const form = new FormData();
   form.append("file", file);
   return fetch(`${API}/upload`, { method: "POST", body: form }).then(asJson);
 }
 
+// Full .qvf -> PowerBI pipeline (extract -> convert -> build), kept exactly
+// as the original single-button flow always worked.
 export function runJob(jobId) {
-  return fetch(`${API}/${jobId}/run`, { method: "POST" }).then(asJson);
+  return post(`/${jobId}/run`);
+}
+
+// Per-stage endpoints (extract only / one convert sub-stage / build only).
+export function extractJob(jobId) {
+  return post(`/${jobId}/extract`);
+}
+export function convertScriptJob(jobId) {
+  return post(`/${jobId}/convert/script`);
+}
+export function convertDataModelJob(jobId) {
+  return post(`/${jobId}/convert/data-model`);
+}
+export function convertSheetJob(jobId) {
+  return post(`/${jobId}/convert/sheet`);
+}
+export function convertAllJob(jobId) {
+  return post(`/${jobId}/convert`);
+}
+export function buildJob(jobId) {
+  return post(`/${jobId}/build`);
+}
+
+export function getJob(jobId) {
+  return fetch(`${API}/${jobId}`).then(asJson);
 }
 
 export function getLogs(jobId, since) {

@@ -27,3 +27,5 @@ backend/uploads/*
 .idea/
 .DS_Store
 Thumbs.db
+
+qlik-bi-components/
