@@ -68,9 +68,52 @@ def _relocate_button_action(visual_json: dict, inner_visual: dict) -> None:
     general[0].setdefault("properties", {})["action"] = action
 
 
-def write_report(report_dir: str, pages: list[dict], *, app_name: str) -> None:
+def _sanitize_visual_extra_keys(visual: dict, inner_visual: dict) -> None:
+    """Two more shape mistakes seen in practice, both rejecting the WHOLE
+    report the same way `action`-inside-`visual` does ("An additional
+    property '<x>' was included in the /visual[/query] property"):
+
+    1. `confidence`/`notes` — this task's own review metadata (see
+       sheets_convert.skill.md's Task C) — belong as top-level siblings of
+       `visual` on the SAME visual entry, and the skill says outright "the
+       builder strips it before writing the real PBIR file". Strip them
+       from wherever they land: the correct top-level spot (`visual`, the
+       whole dict passed in here, not `inner_visual`), AND defensively
+       from `inner_visual` itself, since real output has shown the LLM
+       nesting them a level too deep despite the documented shape.
+    2. `objects` — visual-level formatting/style overrides — belongs as a
+       sibling of `query` inside `visual`, never nested one level deeper
+       INSIDE `query` itself (PBIR's `query` only ever has `queryState`).
+       Relocate it up a level if found there, without clobbering an
+       `objects` that's already correctly placed at the `visual` level.
+
+    Same defensive philosophy as `_relocate_button_action` right above —
+    never trust every LLM response to get this exactly right."""
+    visual.pop("confidence", None)
+    visual.pop("notes", None)
+    if not isinstance(inner_visual, dict):
+        return
+    inner_visual.pop("confidence", None)
+    inner_visual.pop("notes", None)
+    query = inner_visual.get("query")
+    if isinstance(query, dict) and "objects" in query:
+        misplaced_objects = query.pop("objects")
+        inner_visual.setdefault("objects", misplaced_objects)
+
+
+def write_report(report_dir: str, pages: list[dict], *, app_name: str, custom_theme: dict | None = None) -> None:
     """`pages` is a list of {"page": {...}, "visuals": [...]}` dicts, one per
-    Qlik sheet, as produced by llm_convert._convert_report."""
+    Qlik sheet, as produced by llm_convert._convert_report.
+
+    `custom_theme` (see build/theme.py) is a Power BI Report Theme JSON
+    built from the source Qlik app's own extracted color palette — when
+    given, it's written into the project as a REGISTERED (user-added)
+    theme and set as the report's active theme, alongside the default base
+    theme (kept as the underlying foundation every theme builds on top
+    of — Power BI always needs one, custom or not, see below). When None
+    (no usable color was extracted from this app), the report uses the
+    plain default base theme only, exactly as before this parameter
+    existed."""
     defn_dir = os.path.join(report_dir, "definition")
     pages_dir = os.path.join(defn_dir, "pages")
     # Regenerate from a CLEAN slate. Visual/page folder names are derived
@@ -109,24 +152,55 @@ def write_report(report_dir: str, pages: list[dict], *, app_name: str) -> None:
     # our earlier version had no $schema at all, and reportVersionAtImport
     # is a {visual, report, page} object, not a bare version string.
     default_theme_name = "CY24SU08"
+    resource_packages = [
+        {
+            "name": "SharedResources",
+            "type": "SharedResources",
+            "items": [
+                {"name": default_theme_name, "path": f"BaseThemes/{default_theme_name}.json", "type": "BaseTheme"}
+            ],
+        }
+    ]
+    theme_collection = {
+        "baseTheme": {
+            "name": default_theme_name,
+            "reportVersionAtImport": {"visual": "1.8.50", "report": "2.0.50", "page": "1.3.50"},
+            "type": "SharedResources",
+        }
+    }
+    if custom_theme:
+        # A REGISTERED (user-added) theme, as opposed to one of Power BI's
+        # own built-in named themes (the baseTheme above, which Desktop
+        # already knows by name with no file needed) — this one's actual
+        # JSON content has to physically exist in the project for Desktop
+        # (and pbip-compiler) to find it, under StaticResources/
+        # RegisteredResources/, confirmed against how Power BI Desktop
+        # itself lays out a theme added via View > Themes > Browse for
+        # themes. baseTheme is deliberately kept alongside customTheme
+        # (not replaced) — it's the foundation Power BI still falls back
+        # to for anything the custom theme's own (deliberately minimal —
+        # just name + dataColors) JSON doesn't specify itself.
+        theme_name = custom_theme["name"]
+        theme_filename = f"{_safe(theme_name)}.json"
+        registered_dir = os.path.join(report_dir, "StaticResources", "RegisteredResources")
+        os.makedirs(registered_dir, exist_ok=True)
+        with open(os.path.join(registered_dir, theme_filename), "w", encoding="utf-8") as f:
+            json.dump(custom_theme, f, indent=2)
+        theme_collection["customTheme"] = {
+            "name": theme_name,
+            "reportVersionAtImport": {"visual": "1.8.50", "report": "2.0.50", "page": "1.3.50"},
+            "type": "RegisteredResources",
+        }
+        resource_packages.append({
+            "name": "RegisteredResources",
+            "type": "RegisteredResources",
+            "items": [{"name": theme_name, "path": theme_filename, "type": "CustomTheme"}],
+        })
+
     report_json = {
         "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/report/3.1.0/schema.json",
-        "themeCollection": {
-            "baseTheme": {
-                "name": default_theme_name,
-                "reportVersionAtImport": {"visual": "1.8.50", "report": "2.0.50", "page": "1.3.50"},
-                "type": "SharedResources",
-            }
-        },
-        "resourcePackages": [
-            {
-                "name": "SharedResources",
-                "type": "SharedResources",
-                "items": [
-                    {"name": default_theme_name, "path": f"BaseThemes/{default_theme_name}.json", "type": "BaseTheme"}
-                ],
-            }
-        ],
+        "themeCollection": theme_collection,
+        "resourcePackages": resource_packages,
         "settings": {},
     }
     with open(os.path.join(defn_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -196,6 +270,7 @@ def write_report(report_dir: str, pages: list[dict], *, app_name: str) -> None:
             if "filterConfig" in visual:
                 visual_json["filterConfig"] = visual["filterConfig"]
             _relocate_button_action(visual_json, inner_visual)
+            _sanitize_visual_extra_keys(visual, inner_visual)
             if name_map:
                 visual_json = _rewrite_name_refs(visual_json, name_map)
                 visual_json["name"] = visual_id  # never let a ref-rewrite touch our own key

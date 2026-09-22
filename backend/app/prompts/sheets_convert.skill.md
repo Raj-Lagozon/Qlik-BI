@@ -666,6 +666,38 @@ level shown above. Action `"type"` values: `"PageNavigation"` (destination:
 a page name), `"Bookmark"` (destination: a bookmark name/guid), `"WebUrl"`
 (destination: the URL string), `"Drillthrough"`, `"QnA"`.
 
+**`confidence` and `notes` are top-level siblings of `visual` — one level
+up from it, on the SAME visual entry, never keys inside `visual` itself —
+and `objects` is a sibling of `query` inside `visual`, never nested one
+level deeper INSIDE `query`.** These are two of the most common shape
+mistakes in this task's output, both invalid PBIR for the exact same
+reason `action`-inside-`visual` is above (`visual`'s only allowed keys are
+`visualType`/`query`/`objects`; `query`'s only allowed key is
+`queryState`):
+```json
+// WRONG — confidence/notes inside visual, objects nested inside query
+{
+  "name": "<objectId>",
+  "visual": {
+    "visualType": "card",
+    "query": {"queryState": {...}, "objects": {}},
+    "confidence": "high",
+    "notes": "..."
+  }
+}
+// RIGHT — confidence/notes beside visual, objects beside query
+{
+  "name": "<objectId>",
+  "visual": {
+    "visualType": "card",
+    "query": {"queryState": {...}},
+    "objects": {}
+  },
+  "confidence": "high",
+  "notes": "..."
+}
+```
+
 If a Qlik object type has no reasonable Power BI equivalent (e.g. a custom
 extension object) **and it has no `qHyperCubeDef` of its own** (no real
 dimensions/measures bound to it — a pure decorative/config extension), emit

@@ -93,6 +93,12 @@ def extract_app(
             if kpi_containers:
                 names = ", ".join(k["table"] for k in kpi_containers)
                 print(f"[extract] detected KPI container config table(s): {names}")
+
+            theme = _get_theme(session, variables, sheets)
+            _write_json(out_dir, "theme.json", theme)
+            if theme["colors"]:
+                print(f"[extract] detected {len(theme['colors'])} theme color(s) "
+                      f"({'app theme: ' + theme['app_theme_name'] if theme['app_theme_name'] else 'harvested from variables/visuals'})")
     finally:
         if keep_app:
             print(f"[extract] keeping app {app_id} in Qlik Cloud (--keep-app)")
@@ -185,6 +191,62 @@ def _get_data_model_with_retry(session: EngineSession, script: str) -> dict:
         "Cloud tenant. Fix/register that connection (or point the script "
         "at one that exists) and re-run extract."
     )
+
+
+_HEX_COLOR_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
+
+
+def _get_theme(session: EngineSession, variables: list[dict], sheets: list[dict]) -> dict:
+    """Qlik's own branding/palette, recovered two ways (neither requires
+    pulling any business row data):
+
+    1. The app's actually-configured Qlik theme NAME, via GetAppProperties
+       — informational only (Qlik and Power BI theme systems are
+       unrelated/non-transferable formats, so this can't be converted
+       directly into a Power BI theme file), but worth recording so a
+       person picking a matching Power BI theme by hand knows what to
+       look for.
+    2. A real, usable COLOR PALETTE, harvested from the two places a Qlik
+       app's actual brand colors consistently show up: variables whose own
+       definition is a literal hex color (this app's earlier `vTeal`,
+       `vAmber`, `vRed`, `vGreen`, `vNavyBlue`, etc. — a script author
+       naming a handful of variables after colors and defining them as hex
+       is the standard Qlik idiom for "the app's palette", used throughout
+       object color-expression overrides instead of Qlik's own generic
+       theme system), and any hex code embedded LITERALLY in an object's
+       own layout (a color picked directly in the object's Appearance
+       panel, never promoted to a variable). Order is preserved
+       (first-seen = most emphasized, typically a KPI/header accent) and
+       duplicates removed — this becomes the build's actual Power BI
+       `dataColors` palette (see project.py/report.py).
+
+    Returns {"app_theme_name": str | None, "colors": [<hex>, ...]}."""
+    app_theme_name = None
+    try:
+        props = session.doc_call("GetAppProperties", [])
+        app_theme_name = (props.get("theme") or "").strip() or None
+    except Exception as exc:
+        print(f"[extract] WARNING: could not read app theme via GetAppProperties: {exc}")
+
+    colors: list[str] = []
+    seen: set[str] = set()
+
+    def _add(hex_code: str) -> None:
+        normalized = hex_code.upper()
+        if normalized not in seen:
+            seen.add(normalized)
+            colors.append(normalized)
+
+    for v in variables:
+        definition = (v.get("definition") or "").strip().strip("'\"")
+        if _HEX_COLOR_RE.fullmatch(definition):
+            _add(definition)
+
+    sheets_text = json.dumps(sheets)
+    for m in _HEX_COLOR_RE.finditer(sheets_text):
+        _add(m.group(0))
+
+    return {"app_theme_name": app_theme_name, "colors": colors}
 
 
 def _fetch_table_rows(session: EngineSession, table: dict) -> list[dict]:

@@ -10,12 +10,14 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 
 from app.setting import settings
 
 from .semantic_model import write_semantic_model
 from .report import write_report
+from .theme import load_theme, build_custom_theme
 from .pbix_compile import compile_pbix
 from .csv_m import (
     generate_partition_m, generate_combined_partition_m, generate_inline_partition_m,
@@ -69,8 +71,120 @@ def _default_source_data_path(extracted_dir: str) -> str:
 OUTPUT_ROOT = str(settings.project_root / "output")
 
 
+# Every one of these substrings, found (case-insensitively) anywhere in a
+# "[build]"/"[convert]"/"[extract]" log line, marks that line as something a
+# PERSON needs to look at or decide on by hand — a gap the pipeline could
+# not close automatically, as opposed to the majority of build-log lines
+# (which just narrate a decision the pipeline made confidently and
+# correctly, e.g. "source file is X per the Qlik script"). Kept as one
+# explicit list rather than inferring it structurally, since "worth a
+# person's attention" is inherently a judgment call the code throughout
+# this file already makes at each print() call site by choosing its own
+# wording — this just recognizes that wording after the fact, generically,
+# so a new manual-attention message anywhere in the pipeline is picked up
+# automatically the moment its own wording includes one of these markers
+# (all genuinely manual-follow-up messages in this codebase already do),
+# with no separate registration step required.
+_MANUAL_REVIEW_MARKERS = (
+    "warning", "note:", "skipped table", "isn't a real table",
+    "bound to a qlik system field", "marked inactive",
+    "ambiguous field", "fields that need to be fixed", "not found —",
+    "dropping relationship",
+)
+
+
+class _ManualReviewCapture:
+    """Tees stdout during a build: every printed line still reaches the
+    real console exactly as before (nothing about the live build log
+    changes), while any line matching _MANUAL_REVIEW_MARKERS is ALSO kept
+    here so build_project can write it to a standalone file afterward —
+    see _write_manual_review_file."""
+
+    def __init__(self, real_stdout):
+        self._real = real_stdout
+        self.notes: list[str] = []
+        self._line_buffer = ""
+
+    def write(self, text: str) -> int:
+        self._real.write(text)
+        self._line_buffer += text
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            lowered = line.casefold()
+            if any(marker in lowered for marker in _MANUAL_REVIEW_MARKERS):
+                self.notes.append(line)
+        return len(text)
+
+    def flush(self) -> None:
+        self._real.flush()
+
+
+def _write_manual_review_file(project_dir: str, app_name: str, notes: list[str]) -> None:
+    """Writes output/<app_name>/MANUAL_REVIEW.md — a standalone checklist of
+    every build-time gap this run couldn't close automatically (unresolved
+    fields, skipped Qlik-internal tables, relationships/hierarchies left
+    out of TMDL, placeholder fallbacks, ambiguous field choices, etc.),
+    pulled straight from the same log lines already printed during the
+    build — see _ManualReviewCapture. Always written, even with zero notes
+    (a short "nothing found" file), so there's one consistent, predictable
+    place to check after every build rather than needing to scroll back
+    through build console output to find out whether anything needs
+    attention."""
+    path = os.path.join(project_dir, "MANUAL_REVIEW.md")
+    lines = [
+        f"# Manual review — {app_name}",
+        "",
+        f"Generated {datetime.datetime.now().isoformat(timespec='seconds')} by the QVF -> PBIX build.",
+        "",
+        "Everything below is something the automated conversion could not resolve on its own — ",
+        "a field/measure it couldn't bind, a Qlik construct with no Power BI equivalent, a relationship ",
+        "or hierarchy it deliberately left out of the model, or a judgment call worth double-checking. ",
+        "Nothing else in the app needed manual attention.",
+        "",
+    ]
+    # Dedupe while preserving first-seen order — the same warning can
+    # legitimately print more than once (e.g. once per page a broken
+    # binding appears on).
+    seen: set[str] = set()
+    deduped = []
+    for note in notes:
+        if note not in seen:
+            seen.add(note)
+            deduped.append(note)
+
+    if not deduped:
+        lines.append("No manual follow-up items were detected in this build.")
+    else:
+        for note in deduped:
+            # Strip the leading "[build] "/"[convert] "/"[extract] " tag —
+            # redundant once every line in this file is already known to
+            # be from the build.
+            text = re.sub(r"^\[(build|convert|extract)\]\s*", "", note)
+            lines.append(f"- {text}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[build] wrote manual-review checklist -> {path} ({len(deduped)} item(s))")
+
+
 def build_project(app_name: str) -> str:
-    """Returns the path to the compiled .pbix file."""
+    """Returns the path to the compiled .pbix file. Also writes
+    output/<app_name>/MANUAL_REVIEW.md summarizing every gap this build
+    couldn't close automatically — see _write_manual_review_file."""
+    project_dir = os.path.join(OUTPUT_ROOT, app_name)
+    os.makedirs(project_dir, exist_ok=True)
+    real_stdout = sys.stdout
+    capture = _ManualReviewCapture(real_stdout)
+    sys.stdout = capture
+    try:
+        pbix_path = _build_project_impl(app_name)
+    finally:
+        sys.stdout = real_stdout
+        _write_manual_review_file(project_dir, app_name, capture.notes)
+    return pbix_path
+
+
+def _build_project_impl(app_name: str) -> str:
     extracted_dir = os.path.join(EXTRACTED_ROOT, app_name)
     converted_dir = os.path.join(CONVERTED_ROOT, app_name)
     project_dir = os.path.join(OUTPUT_ROOT, app_name)
@@ -255,7 +369,12 @@ def build_project(app_name: str) -> str:
     # revisiting with a narrower trigger condition later.
     _sanitize_visual_shapes(pages)
     report_dir = os.path.join(project_dir, f"{app_name}.Report")
-    write_report(report_dir, pages, app_name=app_name)
+    theme_data = load_theme(extracted_dir)
+    custom_theme = build_custom_theme(app_name, theme_data.get("colors", []))
+    if custom_theme:
+        print(f"[build] applying custom report theme '{custom_theme['name']}' "
+              f"({len(custom_theme['dataColors'])} data colors, from the app's own extracted palette)")
+    write_report(report_dir, pages, app_name=app_name, custom_theme=custom_theme)
 
     _write_pbip_file(project_dir, app_name)
 
@@ -884,8 +1003,24 @@ def _detect_source_files_and_sheets(script_text: str) -> dict[str, list[tuple[st
 
 
 _RESIDENT_ONLY_TABLE_RE = re.compile(
-    r"\b(\w+):\s*(?:REPLACE\s+)?LOAD\s+(?:(?!;|\bFROM\b|\bRESIDENT\b).)*?\bRESIDENT\s+(\w+)\b",
+    r"\b(\w+):\s*(?:REPLACE\s+)?LOAD\s+((?:(?!;|\bFROM\b|\bRESIDENT\b).)*?)\bRESIDENT\s+(\w+)\b"
+    r"((?:(?!;).)*)",
     re.IGNORECASE | re.DOTALL,
+)
+# A function name here, found anywhere in a Resident block's own field list
+# or trailing WHERE/GROUP BY clause, means this is a real AGGREGATION/
+# filtering pass (a summary table — new rows computed FROM the source
+# table's rows, not the same rows just reselected/renamed), never the
+# simple "reshape and rename" idiom _detect_resident_only_tables exists
+# for. Reusing that idiom's "borrow the source table's own file, select by
+# these exact column names" strategy for a block like this would silently
+# select NONEXISTENT column names straight off the source FILE (an
+# aggregated/computed field like `Count(DISTINCT DisputeID) AS
+# DisputeCount90d` was never a real file column at all) — every such
+# column would come back null with no visible error, exactly the kind of
+# silent data corruption this whole file's detectors exist to avoid.
+_RESIDENT_AGGREGATION_SIGNAL_RE = re.compile(
+    r"\b(?:count|sum|avg|min|max|group\s+by|where)\b", re.IGNORECASE
 )
 
 
@@ -917,7 +1052,9 @@ def _detect_resident_only_tables(script_text: str) -> dict[str, str]:
     occurrence is as reasonable a guess as any)."""
     out: dict[str, str] = {}
     for m in _RESIDENT_ONLY_TABLE_RE.finditer(script_text):
-        table_name, source_table = m.group(1), m.group(2)
+        table_name, field_list, source_table, trailer = m.group(1), m.group(2), m.group(3), m.group(4)
+        if _RESIDENT_AGGREGATION_SIGNAL_RE.search(field_list) or _RESIDENT_AGGREGATION_SIGNAL_RE.search(trailer):
+            continue
         if table_name not in out:
             out[table_name] = source_table
     return out
