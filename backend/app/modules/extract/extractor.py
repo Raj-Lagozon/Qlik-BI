@@ -463,6 +463,17 @@ def _get_measures(session: EngineSession) -> list[dict]:
             "expression": measure_def.get("qDef"),
             "label_expression": measure_def.get("qLabelExpression"),
             "tags": meta.get("tags", []),
+            # The master measure's OWN configured display format (currency
+            # symbol, %, decimal places, thousands separator) — Qlik computes
+            # this once at authoring time and every KPI/chart bound to this
+            # measure inherits it. Never previously extracted at all, which
+            # meant the DAX conversion had NOTHING to base a measure's
+            # `format_string` on and every currency/percent/thousands-
+            # separator display was silently lost (e.g. "AR at Risk" showing
+            # a bare "3.51M" instead of "$3.51M", "Credit Utilization %"
+            # showing "0.78" instead of "78%"). See project.py's
+            # _qlik_num_format_to_dax for how this gets translated.
+            "num_format": measure_def.get("qNumFormat"),
         })
     return measures
 
@@ -742,10 +753,26 @@ def _container_child_ids(session: EngineSession, container_id: str, obj_info: di
 def _expand_container(session: EngineSession, container_id: str, container_bounds: dict,
                       obj_info: dict, depth: int = 0) -> list[dict]:
     """Recurse into a Qlik container object and return its real child tiles
-    (each with its own type + qHyperCubeDef) as ordinary sheet objects,
-    auto-laid-out in a grid within the container's own bounds (Engine API
-    gives child id/type only, not per-child position). Recurses through
-    nested containers, up to a sane depth limit."""
+    (each with its own type + qHyperCubeDef) as ordinary sheet objects.
+
+    Qlik's native Container object (Engine API's `GetChildInfos`/
+    `qChildList`) is ALWAYS a tab switcher — exactly ONE child renders at a
+    time, at the container's OWN full on-screen position; there is no Qlik
+    container type that shows several children simultaneously in a tiled
+    grid. Every child is therefore given the container's own bounds
+    UNCHANGED, never subdivided into an auto-laid-out grid — an earlier
+    version of this function split the container's bounds into a
+    `min(n,4)`-column grid instead, which was simply the wrong model for
+    what a Container actually is; it also caused every child to be
+    squeezed into a tiny fraction of the real page (confirmed: a container
+    with 15 children ended up with each child ~25% wide and ~1.3% tall of
+    the SHEET, not the container), so those tiny tiles then visually
+    overlapped whatever REAL, unrelated visuals happened to occupy that
+    same small area of the page — the actual cause of a real report
+    looking generally "messy"/overlapping, not just the container's own
+    children conflicting with each other.
+
+    Recurses through nested containers, up to a sane depth limit."""
     if depth > 4:
         print(f"[extract] WARNING: container nesting past depth 4 at '{container_id}' — not recursing further")
         return []
@@ -754,22 +781,27 @@ def _expand_container(session: EngineSession, container_id: str, container_bound
     if not children:
         return []
 
-    n = len(children)
-    cols = min(n, 4) or 1
-    rows = -(-n // cols)  # ceil division
-    cell_w = container_bounds.get("width", cols) / cols
-    cell_h = container_bounds.get("height", rows) / rows
-    base_x = container_bounds.get("x", 0)
-    base_y = container_bounds.get("y", 0)
+    if len(children) > 1:
+        # Still a real, honest Power BI limitation worth flagging even
+        # after this fix: Power BI has no native "only show one of these
+        # at a time" tab mechanism the way Qlik's container does, so every
+        # child still lands on the page as its own always-visible visual,
+        # now correctly SIZED/POSITIONED to match the container's real
+        # area (no longer overlapping unrelated visuals elsewhere), but
+        # still stacked on top of EACH OTHER at that one location. Closing
+        # this gap fully would mean generating a bookmark/button-driven
+        # tab-switching interaction in Power BI — out of scope for
+        # extraction itself; flagged here so it's visible in the build log
+        # rather than only discovered by opening the report.
+        print(f"[extract] container '{container_id}' has {len(children)} tab children — Power BI has no "
+              f"native tab-switching equivalent, so all {len(children)} will render stacked at the same "
+              f"position (each individually correctly sized/positioned to the container's own area, but "
+              f"visible simultaneously rather than one-at-a-time as in Qlik)")
 
     objects: list[dict] = []
-    for i, child in enumerate(children):
+    for child in children:
         child_id = child["id"]
-        col, row = i % cols, i // cols
-        child_bounds = {
-            "x": base_x + col * cell_w, "y": base_y + row * cell_h,
-            "width": cell_w, "height": cell_h,
-        }
+        child_bounds = dict(container_bounds)
         child_info = _get_object_layout(session, child_id)
         if _is_container(child.get("type"), child_info):
             objects.extend(_expand_container(session, child_id, child_bounds, child_info, depth + 1))

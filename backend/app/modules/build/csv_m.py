@@ -288,6 +288,83 @@ def _m_string_literal(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _qlik_date_literal_to_m(literal: str) -> str:
+    import datetime
+    try:
+        d = datetime.datetime.strptime(literal, "%Y-%m-%d")
+        return f"#date({d.year}, {d.month}, {d.day})"
+    except ValueError:
+        # Not the ISO format this script happened to use — fall back to a
+        # quoted text comparison, which still works for a text-typed
+        # column even if it can't be parsed as a real M date value.
+        return _m_string_literal(literal)
+
+
+def generate_groupby_count_partition_m(spec: dict) -> str:
+    """M for a Qlik `TableName: LOAD ApplyMap('Map', Key) AS Alias,
+    Count(DISTINCT Field) AS Measure RESIDENT Source WHERE ... GROUP BY
+    ApplyMap('Map', Key);` table (see project.py's
+    _detect_groupby_count_tables) — built as a REAL, plain Power Query
+    table (Table.Group over a cross-query reference to Source's own M),
+    NOT a DAX calculated table.
+
+    This matters for more than just where the computation runs: a DAX
+    calculated table's columns don't exist yet at the point Power BI
+    Desktop's static project-load validation checks a declared TMDL
+    relationship, so ANY relationship into/out of a calculated table gets
+    silently dropped at build time (see project.py's
+    _drop_relationships_into_related_calc_tables) — which leaves a table
+    like this one's own key column with NO connection to the rest of the
+    model at all, so every measure built on it reads BLANK in any visual
+    grouped by a real dimension, even though the underlying data and
+    relationship were both computed correctly. Confirmed: exactly this
+    happened to a real app's "Dispute Count (90d)" measure — always blank
+    in every customer-grouped table despite a correct, LLM-proposed
+    relationship existing in data_model.converted.json, because that
+    relationship could never be declared in TMDL at all. A plain
+    M-imported table has no such restriction — the relationship declares
+    and resolves normally, the same as any other real table.
+
+    `spec` is one entry from _detect_groupby_count_tables's result:
+    {source_table, key_field, count_field, measure_name, group_alias,
+    value_field, value_source_table, where_field, where_op, where_val}."""
+    source_table = spec["source_table"]
+    value_table = spec["value_source_table"]
+
+    statements = [f"Base = {source_table}"]
+    step = "Base"
+
+    if spec.get("where_field") and spec.get("where_val"):
+        date_literal = _qlik_date_literal_to_m(spec["where_val"])
+        statements.append(
+            f'Filtered = Table.SelectRows(Base, each [{spec["where_field"]}] {spec["where_op"]} {date_literal})'
+        )
+        step = "Filtered"
+
+    # The group-by key isn't a real column on Source — it's looked up via
+    # a mapping table (see project.py's docstring: "ApplyMap('CustomerMap',
+    # InvoiceID)") — reproduced here as a Record.FromList dict built
+    # directly from the mapping's real SOURCE table's own M query (a
+    # cross-query reference; Power Query resolves this into the correct
+    # refresh order automatically), the same idea as
+    # csv_m._mapping_dict_statement uses for a file-backed mapping table,
+    # just sourced from an already-loaded table instead of a fresh CSV.
+    statements.append(
+        f'MapDict = Record.FromList({value_table}[{spec["value_field"]}], '
+        f'List.Transform({value_table}[{spec["key_field"]}], each Text.From(_)))'
+    )
+    statements.append(
+        f'Keyed = Table.AddColumn({step}, "{spec["group_alias"]}", '
+        f'each Record.FieldOrDefault(MapDict, Text.From([{spec["key_field"]}]), null))'
+    )
+    statements.append(
+        f'Grouped = Table.Group(Keyed, {{"{spec["group_alias"]}"}}, '
+        f'{{{{"{spec["measure_name"]}", each List.Count(List.Distinct([{spec["count_field"]}])), Int64.Type}}}})'
+    )
+    body = ",\n    ".join(statements)
+    return f"let\n    {body}\nin\n    Grouped"
+
+
 # Qlik function -> M equivalent for a GROUP BY key / aggregation, mirrored
 # from project.py's _QLIK_TO_M_DATE_FUNC / _QLIK_TO_M_AGG_FUNC (kept here
 # too since this module has no import on project.py — the two dicts must

@@ -47,29 +47,158 @@ def _rewrite_name_refs(node, rename: dict[str, str]):
     return node
 
 
-def _relocate_button_action(visual_json: dict, inner_visual: dict) -> None:
-    """A button visual's `action` (page navigation / bookmark / drillthrough
-    / web URL) is a CONTAINER-level property in real PBIR — it belongs at
-    the top level of visual.json, under `visualContainerObjects.general[0]
-    .properties.action`, the same place title/background/border/tooltip
-    live for ANY visual type. It is NOT a property of `visual` itself
-    (`visual.visualType`/`visual.query`/`visual.objects` are the only keys
-    that belong there). The sheets_convert skill has, in practice, written
-    `action` as a sibling of `visualType` inside `visual` instead — Power BI
-    Desktop rejects the whole report over it ("An additional property
-    'action' was included in the /visual property"). Relocate it here
-    rather than trust every future LLM call to place it correctly, the same
+_QLIK_ACTION_TYPE_TO_VISUALLINK_FIELD = {
+    "PageNavigation": "navigationSection",
+    "Bookmark": "bookmark",
+    "WebUrl": "webUrl",
+    "Drillthrough": "drillthroughSection",
+    "QnA": "qna",
+}
+
+
+def _dax_literal(value) -> dict:
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return {"expr": {"Literal": {"Value": f"'{escaped}'"}}}
+    if isinstance(value, bool):
+        return {"expr": {"Literal": {"Value": "true" if value else "false"}}}
+    return {"expr": {"Literal": {"Value": str(value)}}}
+
+
+def _relocate_button_action(inner_visual: dict) -> None:
+    """A button's navigation (page navigation / bookmark / drillthrough /
+    web URL) is a CONTAINER-level property in real PBIR — but there is no
+    `action` property anywhere in the schema. Confirmed against the real
+    Fabric visualConfiguration schema (definition/visualConfiguration/2.2.0
+    /schema-embedded.json): the actual container object group is
+    `visualLink` (a sibling of `general`/`title`/`subTitle` under
+    `visualContainerObjects`, itself nested INSIDE `visual`), whose `VisualLink`
+    properties are `show`, `type`, `bookmark`, `webUrl`, `navigationSection`,
+    `drillthroughSection`, `qna`, `tooltip`, etc — never a generic `action`/
+    `destination` pair. `{"action": {"type": "PageNavigation", "destination":
+    "<x>"}}` (this skill's own working shape for the LLM to emit, kept
+    because it's simple and unambiguous for the model) is translated here
+    into the real `visualLink` shape: `type` becomes the DAX-literal-quoted
+    action type, and `destination` is written into whichever field that
+    type implies (PageNavigation -> navigationSection, Bookmark -> bookmark,
+    WebUrl -> webUrl, Drillthrough -> drillthroughSection, QnA -> qna).
+    `action` was previously (wrongly) emitted verbatim as a made-up
+    `general[0].properties.action` property, which Power BI Desktop's schema
+    rejected outright ("An additional property 'action' was included in the
+    /visual/visualContainerObjects/general/0/properties property"),
+    corrupting the whole report on open. In practice the LLM has also
+    nested this raw `{"type": ..., "destination": ...}` dict directly under
+    `visualContainerObjects.general[0].properties.action` (skipping the
+    top-level `inner_visual["action"]` shape entirely) alongside a made-up
+    `buttonText` property (also not a real schema property anywhere) — so
+    this function checks both locations. `buttonText`/`text`/`title` found
+    next to `action` (whichever key name the LLM used) is relocated to
+    `visual.objects.text[0].properties.text` — actionButton's own
+    visual-TYPE-SPECIFIC "Text" formatting card, not a container-level
+    property, per Power BI Desktop's real action-button formatting pane
+    (Style/Icon/Text/Outline/Fill) — this placement is a best-effort mapping
+    from that observed formatting-pane structure, not independently
+    schema-verified the way `visualLink` is, so treat it as the primary
+    suspect first if a button's label still doesn't render.
+    Never trust every future LLM call to get this exactly right, the same
     defensive pattern as `_fix_query_refs` in modules/build/project.py."""
-    if not isinstance(inner_visual, dict) or "action" not in inner_visual:
+    if not isinstance(inner_visual, dict):
         return
-    action = inner_visual.pop("action")
-    container_objects = visual_json.setdefault("visualContainerObjects", {})
-    general = container_objects.setdefault("general", [{"properties": {}}])
-    general[0].setdefault("properties", {})["action"] = action
+    action = inner_visual.pop("action", None)
+    button_text = None
+    for key in ("buttonText", "text", "title"):
+        if key in inner_visual:
+            button_text = inner_visual.pop(key)
+            break
+
+    container_objects = inner_visual.get("visualContainerObjects")
+    general = container_objects.get("general") if isinstance(container_objects, dict) else None
+    if isinstance(general, list) and general and isinstance(general[0], dict):
+        props = general[0].get("properties")
+        if isinstance(props, dict):
+            if action is None:
+                action = props.pop("action", None)
+            if button_text is None:
+                for key in ("buttonText", "text", "title"):
+                    if key in props:
+                        button_text = props.pop(key)
+                        break
+            if not props:
+                general.pop(0)
+            if not general:
+                container_objects.pop("general", None)
+
+    if isinstance(action, dict):
+        action_type = action.get("type")
+        destination = action.get("destination")
+        field = _QLIK_ACTION_TYPE_TO_VISUALLINK_FIELD.get(action_type)
+        container_objects = inner_visual.setdefault("visualContainerObjects", {})
+        visual_link = container_objects.setdefault("visualLink", [{"properties": {}}])
+        props = visual_link[0].setdefault("properties", {})
+        props["show"] = _dax_literal(True)
+        if action_type:
+            props["type"] = _dax_literal(action_type)
+        if field and destination:
+            props[field] = _dax_literal(destination)
+
+    if button_text is not None:
+        objects = inner_visual.setdefault("objects", {})
+        text_group = objects.setdefault("text", [{"properties": {}}])
+        text_group[0].setdefault("properties", {})["text"] = (
+            button_text if isinstance(button_text, dict) else _dax_literal(button_text)
+        )
+
+
+def _dax_literal_text(node) -> str | None:
+    """Best-effort extraction of the plain text a `_dax_literal(str)` call
+    produced (single-quoted DAX string literal, with '' as the escaped
+    quote), for re-merging two such literals. Returns None if `node` isn't
+    that shape."""
+    if not isinstance(node, dict):
+        return None
+    value = node.get("expr", {}).get("Literal", {}).get("Value")
+    if not isinstance(value, str) or len(value) < 2 or not value.startswith("'") or not value.endswith("'"):
+        return None
+    return value[1:-1].replace("''", "'")
+
+
+def _relocate_footer_to_subtitle(inner_visual: dict) -> None:
+    """The LLM has, in practice, invented a `footer` property (for a Qlik
+    KPI's footnote/subtext line) under `visualContainerObjects` — this is
+    NOT a real PBIR property anywhere (confirmed against the real Fabric
+    visualConfiguration schema: the only text-bearing container groups are
+    `title` and `subTitle`), and Power BI Desktop rejects the whole report
+    over it ("An additional property 'footer' was included in the
+    /visual/visualContainerObjects property"). Power BI's card/KPI-style
+    visuals have no third text zone to put a footnote in, so the closest
+    honest equivalent is folding the footer text into `subTitle` — appended
+    after any real subtitle text if one is already present, or used as the
+    subtitle outright if not. Same defensive philosophy as
+    `_relocate_button_action` — never trust every LLM response to only use
+    documented property names."""
+    if not isinstance(inner_visual, dict):
+        return
+    container_objects = inner_visual.get("visualContainerObjects")
+    if not isinstance(container_objects, dict) or "footer" not in container_objects:
+        return
+    footer = container_objects.pop("footer")
+    if not isinstance(footer, list) or not footer or not isinstance(footer[0], dict):
+        return
+    footer_props = footer[0].get("properties", {})
+    footer_text = _dax_literal_text(footer_props.get("text"))
+    if footer_text is None:
+        return
+
+    sub_title = container_objects.setdefault("subTitle", [{"properties": {}}])
+    props = sub_title[0].setdefault("properties", {})
+    existing_text = _dax_literal_text(props.get("text"))
+    merged_text = f"{existing_text} · {footer_text}" if existing_text else footer_text
+    props["text"] = _dax_literal(merged_text)
+    props.setdefault("show", _dax_literal(True))
 
 
 def _sanitize_visual_extra_keys(visual: dict, inner_visual: dict) -> None:
-    """Two more shape mistakes seen in practice, both rejecting the WHOLE
+    """Three shape mistakes seen in practice, all rejecting the WHOLE
     report the same way `action`-inside-`visual` does ("An additional
     property '<x>' was included in the /visual[/query] property"):
 
@@ -86,6 +215,15 @@ def _sanitize_visual_extra_keys(visual: dict, inner_visual: dict) -> None:
        INSIDE `query` itself (PBIR's `query` only ever has `queryState`).
        Relocate it up a level if found there, without clobbering an
        `objects` that's already correctly placed at the `visual` level.
+    3. `title`/`subTitle` — a CONTAINER-level property (skill.md's own
+       documented shape puts these under a `visualContainerObjects` key
+       NESTED INSIDE `visual`, the same category as `action`) — but real
+       output has shown the LLM instead nesting them under
+       `visual.objects.title`/`subTitle` (a visual-TYPE-SPECIFIC properties
+       bag, which doesn't recognize these keys at all for most visual
+       types). Relocate them into `visual.visualContainerObjects` if found
+       there, without clobbering a title/subTitle that's already correctly
+       placed.
 
     Same defensive philosophy as `_relocate_button_action` right above —
     never trust every LLM response to get this exactly right."""
@@ -99,6 +237,14 @@ def _sanitize_visual_extra_keys(visual: dict, inner_visual: dict) -> None:
     if isinstance(query, dict) and "objects" in query:
         misplaced_objects = query.pop("objects")
         inner_visual.setdefault("objects", misplaced_objects)
+
+    inner_objects = inner_visual.get("objects")
+    if isinstance(inner_objects, dict):
+        for key in ("title", "subTitle"):
+            if key in inner_objects:
+                misplaced = inner_objects.pop(key)
+                container_objects = inner_visual.setdefault("visualContainerObjects", {})
+                container_objects.setdefault(key, misplaced)
 
 
 def write_report(report_dir: str, pages: list[dict], *, app_name: str, custom_theme: dict | None = None) -> None:
@@ -269,7 +415,25 @@ def write_report(report_dir: str, pages: list[dict], *, app_name: str, custom_th
             }
             if "filterConfig" in visual:
                 visual_json["filterConfig"] = visual["filterConfig"]
-            _relocate_button_action(visual_json, inner_visual)
+            # A container-level property the LLM emitted correctly (title/
+            # subTitle, or a button's action before _relocate_button_action
+            # even runs) was previously DROPPED entirely — the dict literal
+            # above never copied this key from the source `visual` at all,
+            # so even a perfectly-shaped visualContainerObjects from the
+            # LLM never made it into the real file. Copy it in first, before
+            # the two sanitizers below (which both expect to merge INTO
+            # whatever's already here, not create it from nothing).
+            # NOTE: `visualContainerObjects` belongs NESTED INSIDE `visual`
+            # (a sibling of `objects`/`query`), never as a top-level key of
+            # visual.json itself — Power BI Desktop's schema rejects the
+            # latter as an "additional property... in the root property",
+            # corrupting the whole report on open. `inner_visual` here is
+            # the exact same dict object as `visual_json["visual"]`, so
+            # writing into it writes into the right place.
+            if isinstance(visual.get("visualContainerObjects"), dict) and isinstance(inner_visual, dict):
+                inner_visual["visualContainerObjects"] = visual["visualContainerObjects"]
+            _relocate_button_action(inner_visual)
+            _relocate_footer_to_subtitle(inner_visual)
             _sanitize_visual_extra_keys(visual, inner_visual)
             if name_map:
                 visual_json = _rewrite_name_refs(visual_json, name_map)

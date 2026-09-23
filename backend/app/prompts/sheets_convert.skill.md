@@ -602,6 +602,77 @@ writing the real PBIR file. This is intentionally close to real PBIR
 `page.json`/`visual.json` shape — the builder writes it out mostly as-is,
 only filling in boilerplate (`$schema`, `annotations`, GUID-safe names).
 
+## Title, subtitle, and axis title/label visibility — mirror Qlik's own settings, never Power BI's defaults
+Every Qlik object's `layout.properties` carries its OWN configured
+`title`/`subtitle`/`footnote` text and a `showTitles` flag — **always use
+this exact text**, never a generic auto-generated name like "Sum of
+OutstandingAmount by AgingBucket" (Power BI's own default when no title is
+set). A real review of a converted app found titles/subtitles missing or
+replaced with auto-generated names on nearly every chart — this is the
+single most common visual-fidelity gap, so treat it as required, not
+optional, whenever `layout.properties.title`/`subtitle` is non-empty.
+
+Set title/subtitle as `visualContainerObjects` properties — a
+CONTAINER-level property (same category as `action`/border/background
+covered above), NESTED INSIDE `visual` itself (a sibling of `query`/
+`objects`), never as a top-level key of the visual.json file:
+```json
+{
+  "visual": {
+    "visualType": "clusteredColumnChart", "query": {...}, "objects": {},
+    "visualContainerObjects": {
+      "title": [{"properties": {
+        "text": {"expr": {"Literal": {"Value": "'AR Aging Distribution'"}}},
+        "show": {"expr": {"Literal": {"Value": "true"}}}
+      }}],
+      "subTitle": [{"properties": {
+        "text": {"expr": {"Literal": {"Value": "'Outstanding amount by aging bucket'"}}},
+        "show": {"expr": {"Literal": {"Value": "true"}}}
+      }}]
+    }
+  }
+}
+```
+Putting `visualContainerObjects` as a top-level sibling of `visual` (one
+level too shallow) is invalid PBIR ("An additional property
+'visualContainerObjects' was included in the root property of
+visuals/.../visual.json") and rejects the WHOLE report, not just that one
+visual — always nest it inside `visual` as shown above.
+
+**There is no `footer` property anywhere in PBIR — never emit one.** A Qlik
+KPI's `footnote` text (e.g. "Across 20 active accounts") has no dedicated
+container-level slot in Power BI; `title`/`subTitle` are the ONLY two
+text-bearing groups that exist. When a Qlik object has footnote text, fold
+it into `subTitle` instead: if `subtitle` is empty, use the footnote text as
+the subtitle outright; if `subtitle` is already set, append the footnote
+text after it (e.g. `'Outstanding amount by aging bucket · Across 20 active
+accounts'`) — never invent a `footer`/`footnote` key under
+`visualContainerObjects`, Power BI Desktop rejects the WHOLE report over it
+the same way it does for `action`/`buttonText` ("An additional property
+'footer' was included in the /visual/visualContainerObjects property").
+Note the DAX-literal-string quoting inside `Value` — a plain unquoted
+string here is invalid (Value must itself be a valid DAX expression text,
+and `"AR Aging Distribution"` alone isn't one; `'AR Aging Distribution'`
+— a single-quoted string literal — is). If `showTitles` is `false` in the
+Qlik object, set `"show"`'s `Value` to `"false"` instead of omitting the
+title block entirely, so an explicit "hidden" choice is preserved rather
+than left to Power BI's own default (which shows a title by default —
+the opposite of what an explicitly-hidden Qlik title means).
+
+**Axis titles and labels**: a Qlik chart's `dimensionAxis.show`/
+`measureAxis.show` property controls this per axis independently — values
+are `"none"` (nothing shown), `"labels"` (tick labels only, no axis
+title), or `"title-and-labels"`/similar (both). Reproduce this exactly via
+`visual.objects.categoryAxis`/`valueAxis` `showAxisTitle`/`show`
+properties — do NOT let Power BI's own chart-type default decide whether
+an axis title appears; a real review found axis titles appearing in Power
+BI that Qlik never showed (`measureAxis.show: "labels"`, no title, PBI
+showed one anyway), and the reverse (Qlik showing a title, Power BI
+defaulting to none). When genuinely unsure of the exact PBIR property
+path for a specific chart type's axis object, still record Qlik's own
+`show` value in `"notes"` so a person can apply it by hand rather than
+silently falling back to Power BI's default either way.
+
 ## Layout: Qlik grid → Power BI canvas pixels
 Qlik sheets use a 24 (or similar) column grid with `bounds` sometimes given as
 row/col spans instead of pixels. Normalize:
@@ -623,7 +694,8 @@ row/col spans instead of pixels. Normalize:
 | `barchart` (vertical) | `clusteredColumnChart` (or `columnChart` for stacked — check `layout.properties.stacked`) |
 | `barchart` (horizontal) | `clusteredBarChart` |
 | `linechart` | `lineChart` |
-| `combochart` | `lineClusteredColumnComboChart` |
+| `combochart`, 2+ measures (a genuine bar+line combination) | `lineClusteredColumnComboChart` |
+| `combochart`, exactly 1 measure (no line series at all — Qlik's combo object used purely as a bar/column chart, a common authoring choice even with nothing to "combo") | same orientation-aware `clusteredColumnChart`/`clusteredBarChart` choice as plain `barchart` above — never force it into the column-only combo visual type just because Qlik's own object type says "combochart" |
 | `piechart` | `pieChart` |
 | `treemap` | `treemap` |
 | `scatterplot` | `scatterChart` |
@@ -642,29 +714,53 @@ row/col spans instead of pixels. Normalize:
 | `button` (selection/variable-change/navigation/open-URL/trigger action) | button visual (page navigation / bookmark / drillthrough / web URL / Q&A) — classify per ACTION TYPE, not as one blanket mapping: a Qlik selection/variable-set action has no direct Power BI button-action equivalent (approximate with a bookmark capturing the equivalent filter state); "open URL"/"navigate to sheet" map cleanly to Power BI's web-URL/page-navigation actions — see the exact output shape below |
 | Show/Hide or Enable condition on any object | not a visual type — see "Conditional visibility" below |
 
-**A button's `action` is a top-level sibling of `visual`, never a key inside
-it.** `visual.visualType`/`visual.query`/`visual.objects` are the only keys
-`visual` itself may contain — `action` is a CONTAINER-level property (the
-same category as title/background/border/tooltip, which apply to any visual
-type) and belongs under a separate top-level `visualContainerObjects` key,
-next to `visual`, not nested inside it:
+**Determining orientation for `barchart`/`combochart`**: read
+`layout.properties.orientation` on the object itself — it is always
+either `"horizontal"` or `"vertical"` (Qlik's own explicit authoring
+choice, never inferred). `"horizontal"` → `clusteredBarChart`;
+`"vertical"` (or the property absent, which defaults to vertical in
+Qlik) → `clusteredColumnChart`. **Do not default to vertical without
+checking this property** — a real review found a Qlik `combochart`
+explicitly set to `orientation: "horizontal"` converted into a vertical
+`lineClusteredColumnComboChart` anyway, because nothing checked the
+property at all. This applies to `combochart` too whenever it degrades
+to the plain bar/column case above (1 measure, no real combo).
+
+**A button's `action` and its label (`buttonText`) are simple keys directly
+inside `visual`, alongside `visualType`/`objects` — and don't try to
+hand-author the real PBIR `visualLink` schema yourself.** There is no
+`action` or `buttonText` property anywhere in the real Fabric PBIR schema
+at all — the actual container-level property for navigation is
+`visualLink` (fields `type`, `bookmark`, `webUrl`, `navigationSection`,
+`drillthroughSection`, `qna`, each a DAX-literal-quoted value, nested under
+`visual.visualContainerObjects`), and there is no schema property at all
+for a button's label under `visualContainerObjects` either — it belongs in
+`visual.objects.text[0].properties.text`, a visual-TYPE-SPECIFIC property,
+not a container one. Getting that exact shape right from scratch is
+error-prone, so instead emit the simple shape below and the builder
+(modules/build/report.py's `_relocate_button_action`) deterministically
+translates it into the real schema on your behalf — this is the ONLY shape
+to emit for a button, do not construct `visualContainerObjects`/`general`/
+`visualLink` yourself for it:
 ```json
-// WRONG — action nested inside visual
-{"visual": {"visualType": "actionButton", "action": {"type": "PageNavigation", "destination": "<PageId>"}}}
-// RIGHT — action under a sibling visualContainerObjects key
 {
-  "visual": {"visualType": "actionButton", "objects": {}},
-  "visualContainerObjects": {
-    "general": [{"properties": {"action": {"type": "PageNavigation", "destination": "<PageId>"}}}]
+  "name": "<visual id>",
+  "position": {...},
+  "visual": {
+    "visualType": "actionButton",
+    "objects": {},
+    "action": {"type": "PageNavigation", "destination": "<PageId>"},
+    "buttonText": "Collections Strategy Simulator"
   }
 }
 ```
-Putting `action` inside `visual` is invalid PBIR ("An additional property
-'action' was included in the /visual property") and rejects the WHOLE
-report, not just that one button — always emit it at the `visualContainerObjects`
-level shown above. Action `"type"` values: `"PageNavigation"` (destination:
-a page name), `"Bookmark"` (destination: a bookmark name/guid), `"WebUrl"`
-(destination: the URL string), `"Drillthrough"`, `"QnA"`.
+`action` and `buttonText` are direct keys of `visual` (the same object
+`visualType`/`objects` live on) — never nested inside `objects`, and never
+nested inside a hand-built `visualContainerObjects`. `buttonText` is a
+plain string (the builder wraps it in the DAX-literal form itself). Action
+`"type"` values: `"PageNavigation"` (destination: a page name),
+`"Bookmark"` (destination: a bookmark name/guid), `"WebUrl"` (destination:
+the URL string), `"Drillthrough"`, `"QnA"`.
 
 **`confidence` and `notes` are top-level siblings of `visual` — one level
 up from it, on the SAME visual entry, never keys inside `visual` itself —
@@ -972,10 +1068,65 @@ primary measure, never a visual of its own.
   whether Qlik itself groups them as one KPI object with a comparison
   value, not just "more than one number visually near each other."
 
+## Table totals and sort order — mirror Qlik exactly, never Power BI's own default
+A `tableEx`/`pivotTable`'s Qlik source object has its own `layout.properties.totals`
+(`{"show": true|false, "position": "...", "label": "..."}`) — Power BI's
+`tableEx` visual defaults to SHOWING a totals row when nothing says
+otherwise, so an explicit Qlik `totals.show: false` must be reproduced
+explicitly, not left to that default (a real review found an unwanted
+totals row/column in Power BI that Qlik never calculated at all). Set
+`visual.objects.total` accordingly:
+```json
+"objects": {
+  "total": [{"properties": {"totals": {"expr": {"Literal": {"Value": "false"}}}}}]
+}
+```
+If genuinely unsure of the exact property name for a specific visual
+type's totals toggle, still record Qlik's `totals.show` value in
+`"notes"` rather than silently defaulting to Power BI's own behavior
+either way.
+
+**Sort order**: every dimension in a Qlik object's `qHyperCubeDef` carries
+its own `qSortCriterias`/the resolved `qDimensionInfo[].qSortIndicator`
+("A" = ascending, "D" = descending, by the dimension's own value; a
+`qSortByExpression`/measure-based sort is also common — sort by whichever
+measure/expression Qlik itself sorts by, not alphabetically by default).
+Reproduce this as the visual's own sort: for a chart, order the
+`queryState`'s dimension/measure the query is naturally sorted by matches
+this; for `tableEx`/`pivotTable`, set the initial sort column/direction to
+match. A review found charts and tables NOT sorted the way Qlik had them
+(e.g. a weekly trend chart not sorted by week, a risk table not sorted by
+risk value) — this is as important to reproduce as the data itself, since
+an unsorted trend/ranking chart reads as meaningless or wrong even when
+every number in it is correct.
+
 ## Filters (listbox / filterpane objects)
 Each become a `slicer` visual whose `visual.query.queryState.Values`
 projects the bound field; do not create a page-level filter unless the Qlik
 object was explicitly a global/sheet-level filter (`layout.properties.scope`).
+
+**Dropdown vs. checkbox-list style**: a Qlik listbox's
+`layout.properties.layoutOptions.collapseMode` says which — `"always"`
+means Qlik renders it COLLAPSED, click-to-expand (a dropdown), `"never"`
+means always-expanded (a checkbox list). Power BI's own slicer default is
+the checkbox-list style regardless of this setting, so a Qlik dropdown
+filter silently becomes a checkbox list unless this is set explicitly. Set
+it via the slicer's own style property:
+```json
+"objects": {
+  "general": [{"properties": {"style": {"expr": {"Literal": {"Value": "'Dropdown'"}}}}}]
+}
+```
+This exact PBIR property path is not independently verified against a
+Desktop-authored reference file the way title/subTitle/totals above were —
+if you're not fully confident of it, still set it AND record Qlik's own
+`collapseMode` value in `"notes"` (e.g. `"Qlik listbox uses collapseMode:
+'always' (dropdown) — verify the slicer's Style is set to Dropdown in
+Power BI, the exact objects.general.style property path is unconfirmed"`)
+so a person can fix the visual formatting by hand in Power BI Desktop's
+own Format pane if the JSON property name turns out to be wrong, rather
+than silently leaving every dropdown-style Qlik filter as a checkbox list
+with no signal that anything was supposed to be different.
 
 ---
 
