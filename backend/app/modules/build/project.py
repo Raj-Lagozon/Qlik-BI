@@ -10,16 +10,18 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 
 from app.setting import settings
 
 from .semantic_model import write_semantic_model
 from .report import write_report
+from .theme import load_theme, build_custom_theme
 from .pbix_compile import compile_pbix
 from .csv_m import (
     generate_partition_m, generate_combined_partition_m, generate_inline_partition_m,
-    wrap_with_left_join_aggregation,
+    wrap_with_left_join_aggregation, generate_groupby_count_partition_m,
 )
 from .infer_relationships import infer_relationships
 from .what_if_params import detect_what_if_parameters, generate_range_m
@@ -69,8 +71,130 @@ def _default_source_data_path(extracted_dir: str) -> str:
 OUTPUT_ROOT = str(settings.project_root / "output")
 
 
+# Every one of these substrings, found (case-insensitively) anywhere in a
+# "[build]"/"[convert]"/"[extract]" log line, marks that line as something a
+# PERSON needs to look at or decide on by hand — a gap the pipeline could
+# not close automatically, as opposed to the majority of build-log lines
+# (which just narrate a decision the pipeline made confidently and
+# correctly, e.g. "source file is X per the Qlik script"). Kept as one
+# explicit list rather than inferring it structurally, since "worth a
+# person's attention" is inherently a judgment call the code throughout
+# this file already makes at each print() call site by choosing its own
+# wording — this just recognizes that wording after the fact, generically,
+# so a new manual-attention message anywhere in the pipeline is picked up
+# automatically the moment its own wording includes one of these markers
+# (all genuinely manual-follow-up messages in this codebase already do),
+# with no separate registration step required.
+_MANUAL_REVIEW_MARKERS = (
+    "warning", "note:", "skipped table", "isn't a real table",
+    "bound to a qlik system field", "marked inactive",
+    "ambiguous field", "fields that need to be fixed", "not found —",
+    "dropping relationship",
+)
+
+
+class _ManualReviewCapture:
+    """Tees stdout during a build: every printed line still reaches the
+    real console exactly as before (nothing about the live build log
+    changes), while any line matching _MANUAL_REVIEW_MARKERS is ALSO kept
+    here so build_project can write it to a standalone file afterward —
+    see _write_manual_review_file."""
+
+    def __init__(self, real_stdout):
+        self._real = real_stdout
+        self.notes: list[str] = []
+        self._line_buffer = ""
+
+    def write(self, text: str) -> int:
+        try:
+            self._real.write(text)
+        except UnicodeEncodeError:
+            # Windows' console stdout is often cp1252, which can't encode
+            # some Unicode characters a dependency (e.g. pbip_compiler's own
+            # progress prints, which use '→') writes directly — that's
+            # not a build failure, just a terminal encoding limitation, so
+            # degrade to a safe ASCII substitution instead of crashing the
+            # whole build over a cosmetic console character.
+            encoding = getattr(self._real, "encoding", None) or "ascii"
+            self._real.write(text.encode(encoding, errors="replace").decode(encoding))
+        self._line_buffer += text
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            lowered = line.casefold()
+            if any(marker in lowered for marker in _MANUAL_REVIEW_MARKERS):
+                self.notes.append(line)
+        return len(text)
+
+    def flush(self) -> None:
+        self._real.flush()
+
+
+def _write_manual_review_file(project_dir: str, app_name: str, notes: list[str]) -> None:
+    """Writes output/<app_name>/MANUAL_REVIEW.md — a standalone checklist of
+    every build-time gap this run couldn't close automatically (unresolved
+    fields, skipped Qlik-internal tables, relationships/hierarchies left
+    out of TMDL, placeholder fallbacks, ambiguous field choices, etc.),
+    pulled straight from the same log lines already printed during the
+    build — see _ManualReviewCapture. Always written, even with zero notes
+    (a short "nothing found" file), so there's one consistent, predictable
+    place to check after every build rather than needing to scroll back
+    through build console output to find out whether anything needs
+    attention."""
+    path = os.path.join(project_dir, "MANUAL_REVIEW.md")
+    lines = [
+        f"# Manual review — {app_name}",
+        "",
+        f"Generated {datetime.datetime.now().isoformat(timespec='seconds')} by the QVF -> PBIX build.",
+        "",
+        "Everything below is something the automated conversion could not resolve on its own — ",
+        "a field/measure it couldn't bind, a Qlik construct with no Power BI equivalent, a relationship ",
+        "or hierarchy it deliberately left out of the model, or a judgment call worth double-checking. ",
+        "Nothing else in the app needed manual attention.",
+        "",
+    ]
+    # Dedupe while preserving first-seen order — the same warning can
+    # legitimately print more than once (e.g. once per page a broken
+    # binding appears on).
+    seen: set[str] = set()
+    deduped = []
+    for note in notes:
+        if note not in seen:
+            seen.add(note)
+            deduped.append(note)
+
+    if not deduped:
+        lines.append("No manual follow-up items were detected in this build.")
+    else:
+        for note in deduped:
+            # Strip the leading "[build] "/"[convert] "/"[extract] " tag —
+            # redundant once every line in this file is already known to
+            # be from the build.
+            text = re.sub(r"^\[(build|convert|extract)\]\s*", "", note)
+            lines.append(f"- {text}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[build] wrote manual-review checklist -> {path} ({len(deduped)} item(s))")
+
+
 def build_project(app_name: str) -> str:
-    """Returns the path to the compiled .pbix file."""
+    """Returns the path to the compiled .pbix file. Also writes
+    output/<app_name>/MANUAL_REVIEW.md summarizing every gap this build
+    couldn't close automatically — see _write_manual_review_file."""
+    project_dir = os.path.join(OUTPUT_ROOT, app_name)
+    os.makedirs(project_dir, exist_ok=True)
+    real_stdout = sys.stdout
+    capture = _ManualReviewCapture(real_stdout)
+    sys.stdout = capture
+    try:
+        pbix_path = _build_project_impl(app_name)
+    finally:
+        sys.stdout = real_stdout
+        _write_manual_review_file(project_dir, app_name, capture.notes)
+    return pbix_path
+
+
+def _build_project_impl(app_name: str) -> str:
     extracted_dir = os.path.join(EXTRACTED_ROOT, app_name)
     converted_dir = os.path.join(CONVERTED_ROOT, app_name)
     project_dir = os.path.join(OUTPUT_ROOT, app_name)
@@ -99,6 +223,7 @@ def build_project(app_name: str) -> str:
     parameters = [p for p in parameters if p.get("target") == "power_query_parameter"]
 
     pages = _load_pages(converted_dir)
+    _apply_deterministic_visual_types(pages, extracted_dir)
 
     # A Qlik sheet built from its own "Data Model Viewer" (a table listing
     # $Table/$Rows/$Field/... — Qlik's built-in introspection system
@@ -255,7 +380,12 @@ def build_project(app_name: str) -> str:
     # revisiting with a narrower trigger condition later.
     _sanitize_visual_shapes(pages)
     report_dir = os.path.join(project_dir, f"{app_name}.Report")
-    write_report(report_dir, pages, app_name=app_name)
+    theme_data = load_theme(extracted_dir)
+    custom_theme = build_custom_theme(app_name, theme_data.get("colors", []))
+    if custom_theme:
+        print(f"[build] applying custom report theme '{custom_theme['name']}' "
+              f"({len(custom_theme['dataColors'])} data colors, from the app's own extracted palette)")
+    write_report(report_dir, pages, app_name=app_name, custom_theme=custom_theme)
 
     _write_pbip_file(project_dir, app_name)
 
@@ -589,17 +719,6 @@ def _detect_groupby_count_tables(script_text: str) -> dict[str, dict]:
     return out
 
 
-def _qlik_date_literal_to_dax(literal: str) -> str:
-    try:
-        d = datetime.datetime.strptime(literal, "%Y-%m-%d")
-        return f"DATE({d.year}, {d.month}, {d.day})"
-    except ValueError:
-        # Not the ISO format this script happened to use — fall back to
-        # DATEVALUE, which still compares correctly against a real `date`
-        # column regardless of the literal's original text format.
-        return f'DATEVALUE("{literal}")'
-
-
 def _build_groupby_count_table(table_name: str, spec: dict, fields_by_table: dict[str, set[str]]) -> dict | None:
     source_table = spec["source_table"]
     value_table = spec["value_source_table"]
@@ -613,28 +732,19 @@ def _build_groupby_count_table(table_name: str, spec: dict, fields_by_table: dic
     if spec["count_field"] not in fields_by_table[source_table]:
         return None
 
-    base = source_table
-    if spec["where_field"] and spec["where_field"] in fields_by_table[source_table] and spec["where_val"]:
-        date_expr = _qlik_date_literal_to_dax(spec["where_val"])
-        base = f"FILTER({source_table}, {source_table}[{spec['where_field']}] {spec['where_op']} {date_expr})"
-
-    dax_expression = (
-        "SUMMARIZE(\n"
-        f'    ADDCOLUMNS(\n        {base},\n'
-        f'        "{spec["group_alias"]}", RELATED({value_table}[{spec["value_field"]}])\n    ),\n'
-        f'    [{spec["group_alias"]}],\n'
-        f'    "{spec["measure_name"]}", DISTINCTCOUNT({source_table}[{spec["count_field"]}])\n'
-        ")"
-    )
+    m_expression = generate_groupby_count_partition_m(spec)
     columns = [
         {"name": spec["group_alias"], "data_type": "string", "source_column": spec["group_alias"]},
         {"name": spec["measure_name"], "data_type": "int64", "source_column": spec["measure_name"]},
     ]
     print(f"[build] '{table_name}' detected as a Qlik RESIDENT/GROUP BY aggregate over '{source_table}' "
           f"(the group key resolves via mapping to '{value_table}[{spec['value_field']}]') — building it "
-          f"as a DAX calculated table (RELATED + SUMMARIZE) instead of loading from CSV: it was never a "
-          f"source file in Qlik either, it's computed at load time from '{source_table}'.")
-    return {"columns": columns, "m_expression": "", "is_calculated": True, "dax_expression": dax_expression}
+          f"as a real Power Query table (Table.Group over a reference to '{source_table}''s own M), not a "
+          f"DAX calculated table: a calculated table's relationships get silently dropped from TMDL by "
+          f"Power BI Desktop's own project-load validation, which left this exact table's key column "
+          f"disconnected from the rest of the model in a real app before this fix (every measure on it read "
+          f"blank in any customer-grouped visual despite a correct relationship being proposed).")
+    return {"columns": columns, "m_expression": m_expression, "is_calculated": False}
 
 
 _MONTH_DERIVED_RE = re.compile(
@@ -884,8 +994,24 @@ def _detect_source_files_and_sheets(script_text: str) -> dict[str, list[tuple[st
 
 
 _RESIDENT_ONLY_TABLE_RE = re.compile(
-    r"\b(\w+):\s*(?:REPLACE\s+)?LOAD\s+(?:(?!;|\bFROM\b|\bRESIDENT\b).)*?\bRESIDENT\s+(\w+)\b",
+    r"\b(\w+):\s*(?:REPLACE\s+)?LOAD\s+((?:(?!;|\bFROM\b|\bRESIDENT\b).)*?)\bRESIDENT\s+(\w+)\b"
+    r"((?:(?!;).)*)",
     re.IGNORECASE | re.DOTALL,
+)
+# A function name here, found anywhere in a Resident block's own field list
+# or trailing WHERE/GROUP BY clause, means this is a real AGGREGATION/
+# filtering pass (a summary table — new rows computed FROM the source
+# table's rows, not the same rows just reselected/renamed), never the
+# simple "reshape and rename" idiom _detect_resident_only_tables exists
+# for. Reusing that idiom's "borrow the source table's own file, select by
+# these exact column names" strategy for a block like this would silently
+# select NONEXISTENT column names straight off the source FILE (an
+# aggregated/computed field like `Count(DISTINCT DisputeID) AS
+# DisputeCount90d` was never a real file column at all) — every such
+# column would come back null with no visible error, exactly the kind of
+# silent data corruption this whole file's detectors exist to avoid.
+_RESIDENT_AGGREGATION_SIGNAL_RE = re.compile(
+    r"\b(?:count|sum|avg|min|max|group\s+by|where)\b", re.IGNORECASE
 )
 
 
@@ -917,7 +1043,9 @@ def _detect_resident_only_tables(script_text: str) -> dict[str, str]:
     occurrence is as reasonable a guess as any)."""
     out: dict[str, str] = {}
     for m in _RESIDENT_ONLY_TABLE_RE.finditer(script_text):
-        table_name, source_table = m.group(1), m.group(2)
+        table_name, field_list, source_table, trailer = m.group(1), m.group(2), m.group(3), m.group(4)
+        if _RESIDENT_AGGREGATION_SIGNAL_RE.search(field_list) or _RESIDENT_AGGREGATION_SIGNAL_RE.search(trailer):
+            continue
         if table_name not in out:
             out[table_name] = source_table
     return out
@@ -1975,9 +2103,25 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                   f"placing measure on '{_fallback_measure_table}' instead")
         return _fallback_measure_table
 
+    # Ground-truth number format per master measure, keyed by Qlik's own
+    # title (the DAX conversion's own "name" output is that same title
+    # verbatim — confirmed: extracted measures.json's "title" and
+    # measures.converted.json's "name" match exactly for every master
+    # measure) — see _qlik_num_format_to_dax's own docstring for why this
+    # overrides whatever (if anything) the LLM guessed.
+    raw_measures = _load_json(extracted_dir, "measures.json")
+    raw_measures_list = raw_measures if isinstance(raw_measures, list) else raw_measures.get("measures", [])
+    num_format_by_title = {
+        item["title"].casefold(): item.get("num_format")
+        for item in raw_measures_list if item.get("title")
+    }
+
     for m in _load_json(converted_dir, "measures.converted.json").get("measures", []):
         table = _real_table(m.get("table", ""))
         m = {**m, "table": table}
+        dax_format = _qlik_num_format_to_dax(num_format_by_title.get((m.get("name") or "").casefold()))
+        if dax_format:
+            m["format_string"] = dax_format
         measures_by_table.setdefault(table, []).append(m)
         original_measure_table[m["name"].casefold()] = (table, m["name"])
 
@@ -3640,9 +3784,136 @@ def _load_pages(converted_dir: str) -> list[dict]:
     pages = []
     for path in sorted(glob.glob(os.path.join(converted_dir, "page__*.json"))):
         with open(path, encoding="utf-8") as f:
-            pages.append(json.load(f))
+            page = json.load(f)
+        # Defense in depth: modules/sheet/visuals.py already filters a
+        # malformed (non-dict) LLM "visuals" entry before writing this
+        # file, but an OLDER converted/ file written before that fix
+        # existed (or a page written some other way) could still have one
+        # on disk — drop it here too rather than crash every visual on the
+        # page over one bad entry ("'int' object has no attribute 'get'").
+        visuals = page.get("visuals", [])
+        good_visuals = [v for v in visuals if isinstance(v, dict)]
+        if len(good_visuals) != len(visuals):
+            print(f"[build] WARNING: {os.path.basename(path)} has "
+                  f"{len(visuals) - len(good_visuals)} malformed (non-object) visual entr"
+                  f"{'y' if len(visuals) - len(good_visuals) == 1 else 'ies'} on disk — dropping "
+                  f"rather than crashing the build; re-run convert for this app to regenerate cleanly")
+            page["visuals"] = good_visuals
+        pages.append(page)
     _normalize_query_states(pages)
     return pages
+
+
+# Deterministic Qlik object `type` -> Power BI `visualType` for every case
+# that has exactly ONE right answer regardless of the object's own
+# content — kept here as ground truth, applied as an OVERRIDE over
+# whatever the LLM chose (see _apply_deterministic_visual_types below),
+# the same "ground truth wins" pattern as _qlik_num_format_to_dax and
+# type_overrides.json. This exists because prompt-only guidance in
+# sheets_convert.skill.md was NOT reliably followed even when tested
+# correctly in isolation — a real app's `combochart` with
+# `orientation: "horizontal"` and only 1 measure (no real combo) was
+# converted correctly to `clusteredBarChart` in an isolated single-object
+# test call, but back to the wrong `lineClusteredColumnComboChart` when
+# converted as part of a normal full-sheet batch — LLM output for a
+# well-specified but easy-to-miss rule is not consistent enough to trust
+# on its own for something this mechanical.
+_QLIK_TO_PBI_SIMPLE_VISUAL_TYPE = {
+    "linechart": "lineChart",
+    "piechart": "pieChart",
+    "treemap": "treemap",
+    "scatterplot": "scatterChart",
+    "table": "tableEx",
+    "sn-table": "tableEx",
+    "pivot-table": "pivotTable",
+    "gauge": "gauge",
+    "bulletchart": "gauge",
+    "listbox": "slicer",
+}
+
+
+def _deterministic_visual_type(qlik_type: str, props: dict, measure_count: int) -> str | None:
+    """Returns the ONE correct Power BI visualType for a Qlik object whose
+    conversion doesn't require any judgment call — orientation, stacking,
+    and combo-vs-plain-bar are all explicit, readable properties on the
+    object itself, never something to infer/guess. Returns None for a
+    Qlik type this function has no deterministic opinion about (the LLM's
+    own choice is trusted as-is for those)."""
+    qlik_type = (qlik_type or "").casefold()
+    if qlik_type in _QLIK_TO_PBI_SIMPLE_VISUAL_TYPE:
+        return _QLIK_TO_PBI_SIMPLE_VISUAL_TYPE[qlik_type]
+
+    if qlik_type in ("barchart", "combochart"):
+        # A `combochart` with fewer than 2 measures has no second series to
+        # actually "combo" with — Qlik authors commonly pick the combo
+        # object purely as a general-purpose bar/column chart even with
+        # nothing to combine, so it degrades to the same orientation-aware
+        # plain bar/column choice as a real `barchart`. With 2+ measures
+        # it's a genuine bar+line combination, which Power BI only offers
+        # in a COLUMN-based combo visual (no horizontal-bar combo exists
+        # natively) — orientation is moot there, so no override is applied
+        # and the LLM's own combo-visual choice is trusted.
+        if qlik_type == "combochart" and measure_count >= 2:
+            return None
+        orientation = (props.get("orientation") or "vertical").casefold()
+        if orientation == "horizontal":
+            return "clusteredBarChart"
+        return "columnChart" if props.get("stacked") else "clusteredColumnChart"
+
+    return None
+
+
+def _build_qlik_object_index(extracted_dir: str) -> dict[str, dict]:
+    """{object_id: {"type": Qlik type, "properties": layout.properties,
+    "measure_count": int}} for every object across every sheet — the
+    ground truth _apply_deterministic_visual_types compares the LLM's
+    chosen visualType against."""
+    path = os.path.join(extracted_dir, "sheets.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    sheets = data if isinstance(data, list) else data.get("sheets", [])
+    index: dict[str, dict] = {}
+    for sheet in sheets:
+        for obj in sheet.get("objects", []):
+            obj_id = obj.get("id")
+            if not obj_id:
+                continue
+            props = obj.get("layout", {}).get("properties", {}) or {}
+            hc = props.get("qHyperCubeDef", {}) or {}
+            index[obj_id] = {
+                "type": obj.get("type"),
+                "properties": props,
+                "measure_count": len(hc.get("qMeasures", []) or []),
+            }
+    return index
+
+
+def _apply_deterministic_visual_types(pages: list[dict], extracted_dir: str) -> None:
+    """Overrides visual.visualType with the deterministic answer (see
+    _deterministic_visual_type) whenever one exists, regardless of what
+    the LLM chose — applied AFTER conversion so it's a guaranteed
+    correction rather than a hope that the skill's own guidance was
+    followed."""
+    qlik_objects = _build_qlik_object_index(extracted_dir)
+    if not qlik_objects:
+        return
+    for page in pages:
+        for visual in page.get("visuals", []):
+            obj_id = visual.get("name")
+            info = qlik_objects.get(obj_id)
+            if not info:
+                continue
+            visual_obj = visual.get("visual")
+            if not isinstance(visual_obj, dict):
+                continue
+            deterministic = _deterministic_visual_type(info["type"], info["properties"], info["measure_count"])
+            if deterministic and visual_obj.get("visualType") != deterministic:
+                print(f"[build] corrected visual '{obj_id}' visualType "
+                      f"'{visual_obj.get('visualType')}' -> '{deterministic}' "
+                      f"(deterministic, from Qlik's own '{info['type']}'/orientation/measure-count)")
+                visual_obj["visualType"] = deterministic
 
 
 _CARD_TYPES = {"card", "multiRowCard"}
@@ -4068,6 +4339,55 @@ def _merge_relationships(llm_relationships: list[dict], inferred_relationships: 
                   f"(another path already connects these tables — use USERELATIONSHIP() in DAX to activate "
                   f"this one where needed)")
     return merged
+
+
+_QLIK_NUMFORMAT_CURRENCY_RE = re.compile(r"^[^\d#0.,\s]+")
+
+
+def _qlik_num_format_to_dax(num_format: dict | None) -> str | None:
+    """Translates a Qlik master measure's OWN configured display format —
+    `qNumFormat` (see extractor.py's `_get_measures`: `{"qType": "M"|"R"|
+    "F"|"I"|"U"|..., "qFmt": "<mask>", "qnDec": <int>, "qUseThou": 0|1}`) —
+    into a Power BI/DAX `formatString` deterministically, the same
+    "ground truth over LLM guess" philosophy as every other detector in
+    this file. Before this, the DAX conversion had NO number-format
+    information at all to work from (extraction never pulled qNumFormat
+    until now) — every currency/percent/thousands-separator display was
+    silently lost even though Qlik's OWN measure definition specified it
+    (a real review: "AR at Risk -> no formatting (3.51M with title)",
+    "Credit utilization% - 0.78 (no %)", "Total AR outstanding -> 16.22M
+    (no $, comma separation, full digits combined)" — all three are this
+    exact bug, on three different measures).
+
+    Returns None when there's genuinely nothing to translate (no
+    qNumFormat at all, or Qlik's own type is "U"/Unknown with no qFmt
+    mask either — the measure's format was never configured in Qlik
+    either, so there's nothing to reproduce)."""
+    if not num_format or not isinstance(num_format, dict):
+        return None
+    q_type = (num_format.get("qType") or "U").upper()
+    fmt_mask = num_format.get("qFmt") or ""
+    n_dec = num_format.get("qnDec")
+    use_thou = bool(num_format.get("qUseThou"))
+    if q_type == "U" and not fmt_mask:
+        return None
+
+    decimals = int(n_dec) if isinstance(n_dec, int) else (fmt_mask.count("0", fmt_mask.find(".") + 1) if "." in fmt_mask else 0)
+    decimal_part = ("." + "0" * decimals) if decimals > 0 else ""
+
+    if "%" in fmt_mask or q_type == "P":
+        return f"0{decimal_part}%"
+
+    if q_type == "M":
+        currency_match = _QLIK_NUMFORMAT_CURRENCY_RE.match(fmt_mask.strip())
+        symbol = currency_match.group(0).strip() if currency_match else "$"
+        return f'"{symbol}"#,##0{decimal_part}'
+
+    if q_type in ("R", "F", "I", "U"):
+        integer_part = "#,##0" if use_thou else "0"
+        return f"{integer_part}{decimal_part}"
+
+    return None  # date/time/interval qTypes — not a measure format string
 
 
 def _load_json(directory: str, filename: str) -> dict:

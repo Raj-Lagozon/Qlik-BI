@@ -125,6 +125,14 @@ confidence_log: list[dict] = []
 
 def collect_confidence(source: str, items: list[dict]) -> None:
     for item in items:
+        if not isinstance(item, dict):
+            # Defensive: an LLM response can occasionally include a
+            # malformed (non-object) entry in an items list — every caller
+            # of this function is expected to have already filtered these
+            # out, but this is shared plumbing several conversion modules
+            # call, so it shouldn't crash the whole conversion over one
+            # caller that didn't.
+            continue
         confidence = item.get("confidence")
         if confidence in ("medium", "low"):
             confidence_log.append({

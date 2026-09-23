@@ -65,7 +65,22 @@ def convert_report(app_name: str) -> list[str]:
             result = run_skill(skill, payload, json_output=True)
             if merged_page is None:
                 merged_page = result.get("page", {})
-            merged_visuals.extend(result.get("visuals", []))
+            batch_visuals = result.get("visuals", [])
+            # The LLM's JSON response is occasionally malformed for a
+            # large/repetitive batch (a container with many near-identical
+            # small child tiles is the real case this was found on) — a
+            # stray non-dict entry in "visuals" (seen: a raw int) crashes
+            # every downstream consumer that assumes a dict
+            # ("'int' object has no attribute 'get'", both here and later
+            # in report.py's own visual-assembly loop). Drop it and keep
+            # going rather than losing the ENTIRE batch's real visuals over
+            # one malformed entry.
+            good_visuals = [v for v in batch_visuals if isinstance(v, dict)]
+            if len(good_visuals) != len(batch_visuals):
+                print(f"[convert] WARNING: {label} — dropped {len(batch_visuals) - len(good_visuals)} "
+                      f"malformed (non-object) entr{'y' if len(batch_visuals) - len(good_visuals) == 1 else 'ies'} "
+                      f"from the LLM's response instead of crashing the whole batch")
+            merged_visuals.extend(good_visuals)
 
         result = {"page": merged_page or {}, "visuals": merged_visuals}
         collect_confidence("report_visuals", result["visuals"])

@@ -93,6 +93,12 @@ def extract_app(
             if kpi_containers:
                 names = ", ".join(k["table"] for k in kpi_containers)
                 print(f"[extract] detected KPI container config table(s): {names}")
+
+            theme = _get_theme(session, variables, sheets)
+            _write_json(out_dir, "theme.json", theme)
+            if theme["colors"]:
+                print(f"[extract] detected {len(theme['colors'])} theme color(s) "
+                      f"({'app theme: ' + theme['app_theme_name'] if theme['app_theme_name'] else 'harvested from variables/visuals'})")
     finally:
         if keep_app:
             print(f"[extract] keeping app {app_id} in Qlik Cloud (--keep-app)")
@@ -185,6 +191,62 @@ def _get_data_model_with_retry(session: EngineSession, script: str) -> dict:
         "Cloud tenant. Fix/register that connection (or point the script "
         "at one that exists) and re-run extract."
     )
+
+
+_HEX_COLOR_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
+
+
+def _get_theme(session: EngineSession, variables: list[dict], sheets: list[dict]) -> dict:
+    """Qlik's own branding/palette, recovered two ways (neither requires
+    pulling any business row data):
+
+    1. The app's actually-configured Qlik theme NAME, via GetAppProperties
+       — informational only (Qlik and Power BI theme systems are
+       unrelated/non-transferable formats, so this can't be converted
+       directly into a Power BI theme file), but worth recording so a
+       person picking a matching Power BI theme by hand knows what to
+       look for.
+    2. A real, usable COLOR PALETTE, harvested from the two places a Qlik
+       app's actual brand colors consistently show up: variables whose own
+       definition is a literal hex color (this app's earlier `vTeal`,
+       `vAmber`, `vRed`, `vGreen`, `vNavyBlue`, etc. — a script author
+       naming a handful of variables after colors and defining them as hex
+       is the standard Qlik idiom for "the app's palette", used throughout
+       object color-expression overrides instead of Qlik's own generic
+       theme system), and any hex code embedded LITERALLY in an object's
+       own layout (a color picked directly in the object's Appearance
+       panel, never promoted to a variable). Order is preserved
+       (first-seen = most emphasized, typically a KPI/header accent) and
+       duplicates removed — this becomes the build's actual Power BI
+       `dataColors` palette (see project.py/report.py).
+
+    Returns {"app_theme_name": str | None, "colors": [<hex>, ...]}."""
+    app_theme_name = None
+    try:
+        props = session.doc_call("GetAppProperties", [])
+        app_theme_name = (props.get("theme") or "").strip() or None
+    except Exception as exc:
+        print(f"[extract] WARNING: could not read app theme via GetAppProperties: {exc}")
+
+    colors: list[str] = []
+    seen: set[str] = set()
+
+    def _add(hex_code: str) -> None:
+        normalized = hex_code.upper()
+        if normalized not in seen:
+            seen.add(normalized)
+            colors.append(normalized)
+
+    for v in variables:
+        definition = (v.get("definition") or "").strip().strip("'\"")
+        if _HEX_COLOR_RE.fullmatch(definition):
+            _add(definition)
+
+    sheets_text = json.dumps(sheets)
+    for m in _HEX_COLOR_RE.finditer(sheets_text):
+        _add(m.group(0))
+
+    return {"app_theme_name": app_theme_name, "colors": colors}
 
 
 def _fetch_table_rows(session: EngineSession, table: dict) -> list[dict]:
@@ -401,6 +463,17 @@ def _get_measures(session: EngineSession) -> list[dict]:
             "expression": measure_def.get("qDef"),
             "label_expression": measure_def.get("qLabelExpression"),
             "tags": meta.get("tags", []),
+            # The master measure's OWN configured display format (currency
+            # symbol, %, decimal places, thousands separator) — Qlik computes
+            # this once at authoring time and every KPI/chart bound to this
+            # measure inherits it. Never previously extracted at all, which
+            # meant the DAX conversion had NOTHING to base a measure's
+            # `format_string` on and every currency/percent/thousands-
+            # separator display was silently lost (e.g. "AR at Risk" showing
+            # a bare "3.51M" instead of "$3.51M", "Credit Utilization %"
+            # showing "0.78" instead of "78%"). See project.py's
+            # _qlik_num_format_to_dax for how this gets translated.
+            "num_format": measure_def.get("qNumFormat"),
         })
     return measures
 
@@ -680,10 +753,26 @@ def _container_child_ids(session: EngineSession, container_id: str, obj_info: di
 def _expand_container(session: EngineSession, container_id: str, container_bounds: dict,
                       obj_info: dict, depth: int = 0) -> list[dict]:
     """Recurse into a Qlik container object and return its real child tiles
-    (each with its own type + qHyperCubeDef) as ordinary sheet objects,
-    auto-laid-out in a grid within the container's own bounds (Engine API
-    gives child id/type only, not per-child position). Recurses through
-    nested containers, up to a sane depth limit."""
+    (each with its own type + qHyperCubeDef) as ordinary sheet objects.
+
+    Qlik's native Container object (Engine API's `GetChildInfos`/
+    `qChildList`) is ALWAYS a tab switcher — exactly ONE child renders at a
+    time, at the container's OWN full on-screen position; there is no Qlik
+    container type that shows several children simultaneously in a tiled
+    grid. Every child is therefore given the container's own bounds
+    UNCHANGED, never subdivided into an auto-laid-out grid — an earlier
+    version of this function split the container's bounds into a
+    `min(n,4)`-column grid instead, which was simply the wrong model for
+    what a Container actually is; it also caused every child to be
+    squeezed into a tiny fraction of the real page (confirmed: a container
+    with 15 children ended up with each child ~25% wide and ~1.3% tall of
+    the SHEET, not the container), so those tiny tiles then visually
+    overlapped whatever REAL, unrelated visuals happened to occupy that
+    same small area of the page — the actual cause of a real report
+    looking generally "messy"/overlapping, not just the container's own
+    children conflicting with each other.
+
+    Recurses through nested containers, up to a sane depth limit."""
     if depth > 4:
         print(f"[extract] WARNING: container nesting past depth 4 at '{container_id}' — not recursing further")
         return []
@@ -692,22 +781,27 @@ def _expand_container(session: EngineSession, container_id: str, container_bound
     if not children:
         return []
 
-    n = len(children)
-    cols = min(n, 4) or 1
-    rows = -(-n // cols)  # ceil division
-    cell_w = container_bounds.get("width", cols) / cols
-    cell_h = container_bounds.get("height", rows) / rows
-    base_x = container_bounds.get("x", 0)
-    base_y = container_bounds.get("y", 0)
+    if len(children) > 1:
+        # Still a real, honest Power BI limitation worth flagging even
+        # after this fix: Power BI has no native "only show one of these
+        # at a time" tab mechanism the way Qlik's container does, so every
+        # child still lands on the page as its own always-visible visual,
+        # now correctly SIZED/POSITIONED to match the container's real
+        # area (no longer overlapping unrelated visuals elsewhere), but
+        # still stacked on top of EACH OTHER at that one location. Closing
+        # this gap fully would mean generating a bookmark/button-driven
+        # tab-switching interaction in Power BI — out of scope for
+        # extraction itself; flagged here so it's visible in the build log
+        # rather than only discovered by opening the report.
+        print(f"[extract] container '{container_id}' has {len(children)} tab children — Power BI has no "
+              f"native tab-switching equivalent, so all {len(children)} will render stacked at the same "
+              f"position (each individually correctly sized/positioned to the container's own area, but "
+              f"visible simultaneously rather than one-at-a-time as in Qlik)")
 
     objects: list[dict] = []
-    for i, child in enumerate(children):
+    for child in children:
         child_id = child["id"]
-        col, row = i % cols, i // cols
-        child_bounds = {
-            "x": base_x + col * cell_w, "y": base_y + row * cell_h,
-            "width": cell_w, "height": cell_h,
-        }
+        child_bounds = dict(container_bounds)
         child_info = _get_object_layout(session, child_id)
         if _is_container(child.get("type"), child_info):
             objects.extend(_expand_container(session, child_id, child_bounds, child_info, depth + 1))
