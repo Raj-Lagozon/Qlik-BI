@@ -26,6 +26,7 @@ from .csv_m import (
 from .infer_relationships import infer_relationships
 from .what_if_params import detect_what_if_parameters, generate_range_m
 from .scenario_buttons import detect_variable_scenarios, generate_scenario_table_m
+from .bookmarks import write_bookmarks
 
 EXTRACTED_ROOT = str(settings.project_root / "extracted")
 CONVERTED_ROOT = str(settings.project_root / "converted")
@@ -219,6 +220,7 @@ def _build_project_impl(app_name: str) -> str:
     relationships = _drop_relationships_into_related_calc_tables(relationships, tables)
     relationships = _drop_relationships_with_non_unique_one_side(relationships, tables)
     roles = _load_json(converted_dir, "rls.converted.json").get("roles", [])
+    _warn_userelationship_rls_collision(relationships, roles)
     parameters = _load_json(converted_dir, "variables.converted.json").get("variables", [])
     parameters = [p for p in parameters if p.get("target") == "power_query_parameter"]
 
@@ -385,7 +387,18 @@ def _build_project_impl(app_name: str) -> str:
     if custom_theme:
         print(f"[build] applying custom report theme '{custom_theme['name']}' "
               f"({len(custom_theme['dataColors'])} data colors, from the app's own extracted palette)")
-    write_report(report_dir, pages, app_name=app_name, custom_theme=custom_theme)
+
+    # Real bookmark files must exist BEFORE write_report runs, so its
+    # button-action relocator (_relocate_button_action in report.py) can
+    # resolve a "Bookmark" action's destination against a bookmark that
+    # actually exists in the project, instead of a dangling reference to
+    # the raw Qlik bookmark id/title the LLM happened to emit.
+    page_order = [p.get("page", {}).get("name") for p in pages if p.get("page", {}).get("name")]
+    bookmarks = _load_json(extracted_dir, "bookmarks.json")
+    bookmarks = bookmarks if isinstance(bookmarks, list) else []
+    bookmark_lookup = write_bookmarks(report_dir, bookmarks, page_order)
+
+    write_report(report_dir, pages, app_name=app_name, custom_theme=custom_theme, bookmark_lookup=bookmark_lookup)
 
     _write_pbip_file(project_dir, app_name)
 
@@ -414,7 +427,26 @@ def _build_project_impl(app_name: str) -> str:
     # .pbix loses the "edit in one place" convenience, in exchange for
     # actually opening.
     pbix_path = os.path.join(project_dir, f"{app_name}.pbix")
-    tables_for_compile = _tables_with_inlined_source(tables, source_data_path)
+
+    # EXPERIMENTAL, opt-in via env var (see pbix_parameter_patch.py's own
+    # docstring for the full explanation): try keeping SourceDataPath as a
+    # REAL, editable Power Query Parameter in the compiled .pbix instead of
+    # inlining it to a literal. UNVERIFIED against real Power BI Desktop —
+    # never on by default, so every existing build keeps the safe,
+    # proven-working literal-inlined behavior unless explicitly requested.
+    use_real_parameters = os.environ.get("PBIX_REAL_PARAMETERS") == "1"
+    if use_real_parameters:
+        from .pbix_parameter_patch import enable_real_parameters, queue_parameter
+        enable_real_parameters()
+        literal = '"' + source_data_path.replace('"', '""') + '"'
+        queue_parameter("SourceDataPath", literal, default_value=source_data_path)
+        tables_for_compile = tables  # keep the real SourceDataPath reference, don't inline it
+        print(f"[build] PBIX_REAL_PARAMETERS=1: attempting to keep 'SourceDataPath' as a real "
+              f"Power Query Parameter in the compiled .pbix (EXPERIMENTAL — verify it actually "
+              f"opens in Power BI Desktop before trusting this).")
+    else:
+        tables_for_compile = _tables_with_inlined_source(tables, source_data_path)
+
     with tempfile.TemporaryDirectory(prefix=f"{app_name}_compile_") as tmp_dir:
         tmp_sm_dir = os.path.join(tmp_dir, f"{app_name}.SemanticModel")
         write_semantic_model(
@@ -2122,6 +2154,24 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
         dax_format = _qlik_num_format_to_dax(num_format_by_title.get((m.get("name") or "").casefold()))
         if dax_format:
             m["format_string"] = dax_format
+            if dax_format.rstrip().endswith("%"):
+                # A "0%"-style DAX format string ALSO auto-multiplies its
+                # underlying value by 100 for display, the same convention
+                # Qlik uses — so this is correct IF the measure's own DAX
+                # expression already evaluates to a 0-1 fraction the way
+                # Qlik's did. There's no way to know that from qNumFormat
+                # alone (it describes the DISPLAY mask, not whether the
+                # expression itself already contains a manual "* 100"),
+                # and a Qlik author occasionally does both — get the wrong
+                # magnitude by 100x either way (15% shown as 1500%, or 0.15%
+                # shown for what should be 15%) and it's silent, since the
+                # value still looks like a plausible number. Flag every
+                # percent-formatted measure once, for a one-time manual
+                # check against the actual displayed value.
+                print(f"[build] WARNING: measure '{m['name']}' on '{table}' got a percent DAX format "
+                      f"string ({dax_format!r}) from Qlik's own qNumFormat — verify the measure's DAX "
+                      f"expression evaluates to a 0-1 fraction (not already pre-multiplied by 100), or "
+                      f"the displayed percentage will be off by a factor of 100.")
         measures_by_table.setdefault(table, []).append(m)
         original_measure_table[m["name"].casefold()] = (table, m["name"])
 
@@ -2542,6 +2592,22 @@ def _fix_measure_self_references(
                 return match.group(0)
             if table_name in column_owner.get(key, set()):
                 return match.group(0)  # a real column by this exact name exists — ambiguous, leave alone
+            if measure_index[key].casefold() == name.casefold():
+                # Never "fix" a measure's own phantom-table reference into
+                # a bare reference to ITSELF — this happens whenever a
+                # variable name doubles as both the DAX measure's own name
+                # and the column name inside an invented, never-materialized
+                # parameter-table reference (e.g. `'vCurrentSheet
+                # Parameter'[vCurrentSheet]` on the `vCurrentSheet` measure
+                # itself — a real, confirmed case). "Correcting" that to
+                # `[vCurrentSheet]` makes the measure reference itself, a
+                # genuine circular dependency Power BI Desktop rejects on
+                # open. Leave the table-qualified form in place instead;
+                # `_fix_phantom_table_refs` (run right after this) already
+                # has its own matching self-reference guard and will
+                # correctly fall through to BLANK() with a proper warning,
+                # since the phantom parameter table genuinely doesn't exist.
+                return match.group(0)
             fixed = f"[{measure_index[key]}]"
             if fixed != match.group(0):
                 print(f"[build] fixed measure reference in '{name}': "
@@ -2606,7 +2672,22 @@ def _fix_phantom_table_refs(
                 print(f"[build] {kind} '{name}': repointed '{ref_table}[{col}]' -> '{real}'[{col}] "
                       f"('{ref_table}' is not a real table)")
                 return f"'{real}'[{col}]"
-            if col.casefold() in measure_names:
+            if col.casefold() in measure_names and measure_names[col.casefold()].casefold() != name.casefold():
+                # Guard against repointing a measure's phantom-table
+                # reference to ITSELF: a Qlik variable name (e.g.
+                # `vCurrentSheet`) very commonly becomes both the DAX
+                # measure's own name AND the column name inside an
+                # LLM-invented (never actually materialized) parameter
+                # table reference like `'vCurrentSheet Parameter'
+                # [vCurrentSheet]` — column name and measure name collide
+                # by construction, not coincidence. Without this check,
+                # `[vCurrentSheet]` "resolves" to the very measure being
+                # defined, producing a real, confirmed circular-dependency
+                # error in Power BI Desktop ("Measure: 'X'[vCurrentSheet],
+                # Measure: 'X'[vCurrentSheet]") on open. Fall through to
+                # the unresolved/BLANK() path instead — the phantom
+                # parameter table genuinely doesn't exist, so there's
+                # nothing else this expression can correctly resolve to.
                 print(f"[build] {kind} '{name}': '{ref_table}[{col}]' -> [{measure_names[col.casefold()]}] "
                       f"(measure reference, '{ref_table}' is not a real table)")
                 return f"[{measure_names[col.casefold()]}]"
@@ -4339,6 +4420,41 @@ def _merge_relationships(llm_relationships: list[dict], inferred_relationships: 
                   f"(another path already connects these tables — use USERELATIONSHIP() in DAX to activate "
                   f"this one where needed)")
     return merged
+
+
+def _warn_userelationship_rls_collision(relationships: list[dict], roles: list[dict]) -> None:
+    """DAX's `USERELATIONSHIP()` — the function `_merge_relationships` above
+    tells the user to reach for whenever it deactivates a relationship to
+    break a cycle — cannot be used in any measure that touches a table with
+    a Row-Level-Security role filter defined on it (Microsoft's own docs:
+    "USERELATIONSHIP cannot be used when row level security is defined for
+    the table"). This build already independently derives BOTH pieces —
+    circular-reference-driven inactive relationships (`_merge_relationships`)
+    and Section-Access-derived RLS roles (`rls.converted.json`) — but never
+    cross-checks them against each other. If a table ends up in both sets,
+    the `USERELATIONSHIP()` workaround this build's own printed guidance
+    just told the user to add will actually error out in Power BI at query
+    time. There is no automatic fix for this (redesigning around it is a
+    real modeling decision, not something to silently pick for the user) —
+    only surface it loudly enough to reach MANUAL_REVIEW.md."""
+    rls_tables = {
+        perm.get("table")
+        for role in roles
+        for perm in role.get("table_permissions", [])
+        if perm.get("table")
+    }
+    if not rls_tables:
+        return
+    for rel in relationships:
+        if rel.get("is_active") is False and (rel.get("from_table") in rls_tables or rel.get("to_table") in rls_tables):
+            rls_table = rel["from_table"] if rel.get("from_table") in rls_tables else rel["to_table"]
+            print(f"[build] WARNING: relationship {rel['from_table']}[{rel['from_column']}] -> "
+                  f"{rel['to_table']}[{rel['to_column']}] was deactivated to break a circular reference, "
+                  f"but '{rls_table}' also has a Row-Level Security role filter — USERELATIONSHIP() cannot "
+                  f"be used in any measure on a table with RLS defined (Power BI will error at query time), "
+                  f"so the usual 'activate it with USERELATIONSHIP() where needed' fix does not apply here. "
+                  f"This needs a manual modeling decision (e.g. restructure the relationship instead of "
+                  f"reactivating it per-measure).")
 
 
 _QLIK_NUMFORMAT_CURRENCY_RE = re.compile(r"^[^\d#0.,\s]+")

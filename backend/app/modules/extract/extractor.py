@@ -99,6 +99,11 @@ def extract_app(
             if theme["colors"]:
                 print(f"[extract] detected {len(theme['colors'])} theme color(s) "
                       f"({'app theme: ' + theme['app_theme_name'] if theme['app_theme_name'] else 'harvested from variables/visuals'})")
+
+            bookmarks = _get_bookmarks(session)
+            _write_json(out_dir, "bookmarks.json", bookmarks)
+            if bookmarks:
+                print(f"[extract] detected {len(bookmarks)} bookmark(s)")
     finally:
         if keep_app:
             print(f"[extract] keeping app {app_id} in Qlik Cloud (--keep-app)")
@@ -476,6 +481,64 @@ def _get_measures(session: EngineSession) -> list[dict]:
             "num_format": measure_def.get("qNumFormat"),
         })
     return measures
+
+
+def _get_bookmarks(session: EngineSession) -> list[dict]:
+    """Qlik bookmarks: a saved selection state, optionally tied to a sheet
+    (`qSheetId`). Extracted so build/bookmarks.py can generate REAL Power BI
+    bookmark files — before this existed, a button whose action was "Apply
+    bookmark" had its `destination` set to the Qlik bookmark's raw id/title
+    by the LLM, but no bookmark with that name was ever actually created
+    anywhere in the PBIP project, so the button silently pointed at nothing.
+
+    Same `GenericObjectProperties` list pattern as `_get_measures`/
+    `_get_dimensions`/`_get_variables` (`qBookmarkListDef`), requesting the
+    full `qBookmarkDef` via a `qData` path the same way `qMeasureListDef`
+    needs `"/qMeasure"` to return the real expression instead of just
+    `qInfo`/`qMeta`.
+
+    NOT independently verified against a live Qlik Cloud session in this
+    environment (no test credentials available where this was written) —
+    the `qBookmarkDef`/`qStateData`/`qFieldItems` shape below follows
+    Qlik's documented QIX Engine API schema, but wrapped defensively so a
+    real-world shape surprise degrades to "no bookmarks extracted" (an
+    honest, visible gap) rather than failing extraction entirely."""
+    try:
+        obj_def = {
+            "qInfo": {"qType": "BookmarkList"},
+            "qBookmarkListDef": {
+                "qType": "bookmark",
+                "qData": {"bookmark": "/qBookmark"},
+            },
+        }
+        _, layout = session.create_session_object(obj_def)
+        items = layout.get("qBookmarkList", {}).get("qItems", [])
+    except Exception as exc:
+        print(f"[extract] WARNING: could not read bookmarks ({exc}) — skipping; any button whose "
+              f"action is 'Apply bookmark' will have no real bookmark to point at")
+        return []
+
+    bookmarks = []
+    for item in items:
+        info = item.get("qInfo", {})
+        meta = item.get("qMeta", {})
+        bm_def = item.get("qData", {}).get("bookmark", {})
+        selections = []
+        for state in bm_def.get("qStateData", []):
+            state_name = state.get("qStateName", "$")
+            for field_item in state.get("qFieldItems", []):
+                field_name = (field_item.get("qDef") or {}).get("qName")
+                values = [v.get("qText") for v in field_item.get("qValues", []) if v.get("qText") is not None]
+                if field_name and values:
+                    selections.append({"state": state_name, "field": field_name, "values": values})
+        bookmarks.append({
+            "id": info.get("qId"),
+            "title": meta.get("title"),
+            "description": meta.get("description"),
+            "sheet_id": bm_def.get("qSheetId"),
+            "selections": selections,
+        })
+    return bookmarks
 
 
 def _get_dimensions(session: EngineSession) -> list[dict]:

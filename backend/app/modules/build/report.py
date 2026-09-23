@@ -65,7 +65,7 @@ def _dax_literal(value) -> dict:
     return {"expr": {"Literal": {"Value": str(value)}}}
 
 
-def _relocate_button_action(inner_visual: dict) -> None:
+def _relocate_button_action(inner_visual: dict, bookmark_lookup: dict[str, str] | None = None) -> None:
     """A button's navigation (page navigation / bookmark / drillthrough /
     web URL) is a CONTAINER-level property in real PBIR — but there is no
     `action` property anywhere in the schema. Confirmed against the real
@@ -131,15 +131,52 @@ def _relocate_button_action(inner_visual: dict) -> None:
     if isinstance(action, dict):
         action_type = action.get("type")
         destination = action.get("destination")
+        if action_type == "Bookmark" and destination:
+            # `destination` here is the raw Qlik bookmark id/title the LLM
+            # copied straight from the source action — resolve it against
+            # the REAL bookmark files build/bookmarks.py already wrote
+            # (must run before write_report calls this), rather than
+            # pointing at a name nothing in the project actually defines.
+            resolved = (bookmark_lookup or {}).get(destination.casefold())
+            if resolved:
+                destination = resolved
+            else:
+                print(f"[build] WARNING: button action 'Apply bookmark' -> '{destination}' has no matching "
+                      f"bookmark in this app (bookmark extraction found none, or none by that name/id) — "
+                      f"dropping this button's action rather than pointing it at a bookmark that doesn't "
+                      f"exist.")
+                action_type = None  # falls through to the no-op branch below
+        elif action_type is not None and action_type not in _QLIK_ACTION_TYPE_TO_VISUALLINK_FIELD:
+            # Confirmed, real Power BI Desktop crash (not a load-time schema
+            # rejection — this one only surfaces at RENDER time): Desktop's
+            # own UI code looks up `visualLink.type` in an internal
+            # type->display-label table when building a visual's tooltip
+            # (VisualContainer.getVisualLinkTypeLabel -> "Cannot read
+            # properties of undefined (reading 'displayName')"), and any
+            # string outside the 5 known action types (including a
+            # hallucinated literal like the STRING "None" — seen in
+            # practice, not the same thing as a JSON null/Python None,
+            # which already short-circuits above) has no entry there,
+            # crashing the whole report render. Truthy-checking
+            # `action_type` alone (the old code) let any such string
+            # through untouched; validate against the known-good set
+            # instead and drop the action the same way an unresolved
+            # bookmark destination does, rather than writing a type value
+            # Desktop's own runtime doesn't recognize.
+            print(f"[build] WARNING: button action type {action_type!r} is not a recognized Power BI "
+                  f"visualLink type ({sorted(_QLIK_ACTION_TYPE_TO_VISUALLINK_FIELD)}) — dropping this "
+                  f"button's action rather than writing a value Power BI Desktop's own renderer crashes "
+                  f"on ('Cannot read properties of undefined (reading 'displayName')').")
+            action_type = None
         field = _QLIK_ACTION_TYPE_TO_VISUALLINK_FIELD.get(action_type)
-        container_objects = inner_visual.setdefault("visualContainerObjects", {})
-        visual_link = container_objects.setdefault("visualLink", [{"properties": {}}])
-        props = visual_link[0].setdefault("properties", {})
-        props["show"] = _dax_literal(True)
         if action_type:
+            container_objects = inner_visual.setdefault("visualContainerObjects", {})
+            visual_link = container_objects.setdefault("visualLink", [{"properties": {}}])
+            props = visual_link[0].setdefault("properties", {})
+            props["show"] = _dax_literal(True)
             props["type"] = _dax_literal(action_type)
-        if field and destination:
-            props[field] = _dax_literal(destination)
+            if field and destination:
+                props[field] = _dax_literal(destination)
 
     if button_text is not None:
         objects = inner_visual.setdefault("objects", {})
@@ -247,9 +284,88 @@ def _sanitize_visual_extra_keys(visual: dict, inner_visual: dict) -> None:
                 container_objects.setdefault(key, misplaced)
 
 
-def write_report(report_dir: str, pages: list[dict], *, app_name: str, custom_theme: dict | None = None) -> None:
+# The complete, confirmed set of keys `visual` itself is allowed to carry
+# (verified against the real Fabric visualConfiguration schema — see
+# _relocate_unknown_visual_keys below). Every prior fix in this class
+# (`action`, `buttonText`, `footer`, now `shapeType`) was the SAME root
+# cause: the LLM inventing a plausible-sounding property name and putting
+# it directly on `visual` instead of nesting it inside `objects` (a
+# visual-TYPE-specific formatting bag) or `visualContainerObjects` (a
+# CONTAINER-level bag). Rather than keep adding one more special case each
+# time a new invented property name is reported, catch every remaining
+# unknown key here too.
+_VISUAL_ALLOWED_KEYS = {
+    "visualType", "query", "objects", "visualContainerObjects",
+    "autoSelectVisualType", "expansionStates", "syncGroup", "drillFilterOtherVisuals",
+}
+
+# Visual-type-specific property names this project has seen the LLM emit
+# directly on `visual` that map to a known real object group inside
+# `visual.objects` — checked BEFORE the generic catch-all below, since a
+# correct specific placement is better than a generic dumping ground.
+# `shapeType` is a Power BI Shape visual's own "Shape" formatting card
+# property (Type: Rectangle/Oval/Line/Triangle/Arrow) — this mapping is a
+# best-effort inference from Power BI Desktop's known Shape-visual
+# formatting pane layout, not independently schema-verified the way the
+# generic `visual` envelope keys above are (Microsoft's public PBIR schema
+# doesn't publish per-visual-type formatting object definitions at all —
+# those live in each visual's own, non-public capabilities.json).
+_KNOWN_MISPLACED_VISUAL_PROPERTIES = {
+    "shapeType": "shape",
+}
+
+
+def _relocate_unknown_visual_keys(inner_visual: dict) -> None:
+    """Defense-in-depth catch-all for any key directly on `visual` that
+    isn't one of `_VISUAL_ALLOWED_KEYS` — Power BI Desktop rejects the
+    WHOLE report the moment it sees even one ("An additional property
+    '<x>' was included in the /visual property"), so every unrecognized
+    key must be relocated somewhere valid, never left in place. A key with
+    a known mapping (`_KNOWN_MISPLACED_VISUAL_PROPERTIES`) goes to its
+    named object group; anything else falls back to
+    `objects.general[0].properties` — `objects.<any group>.properties` has
+    never triggered this class of whole-report-rejecting schema error in
+    this project's testing (only the structural envelope directly on
+    `visual`/`visualContainerObjects` is this strictly validated), so a
+    generic bucket is a safe worst-case landing spot even for a property
+    name nobody has seen yet."""
+    if not isinstance(inner_visual, dict):
+        return
+    for key in list(inner_visual.keys()):
+        if key in _VISUAL_ALLOWED_KEYS:
+            continue
+        value = inner_visual.pop(key)
+        # Formatting-object properties are always DAX-literal-wrapped
+        # ({"expr": {"Literal": {"Value": ...}}}) in real PBIR, the same
+        # convention as title/subTitle/visualLink/text elsewhere in this
+        # file — wrap a raw plain value (string/bool/number) the LLM
+        # emitted directly, rather than leaving an un-wrapped primitive
+        # where Power BI expects that shape.
+        if not isinstance(value, dict):
+            value = _dax_literal(value)
+        group_name = _KNOWN_MISPLACED_VISUAL_PROPERTIES.get(key, "general")
+        objects = inner_visual.setdefault("objects", {})
+        group = objects.setdefault(group_name, [{"properties": {}}])
+        group[0].setdefault("properties", {})[key] = value
+        print(f"[build] WARNING: relocated unrecognized visual-level property '{key}' into "
+              f"objects.{group_name}[0].properties — this is not a real PBIR key directly on "
+              f"'visual' and would otherwise reject the whole report on open.")
+
+
+def write_report(
+    report_dir: str, pages: list[dict], *, app_name: str,
+    custom_theme: dict | None = None, bookmark_lookup: dict[str, str] | None = None,
+) -> None:
     """`pages` is a list of {"page": {...}, "visuals": [...]}` dicts, one per
     Qlik sheet, as produced by llm_convert._convert_report.
+
+    `bookmark_lookup` (see build/bookmarks.py's `write_bookmarks`, which
+    must run BEFORE this function) maps a Qlik bookmark's own `id` and
+    casefolded `title` to the real PBI bookmark `name` generated for it —
+    used by `_relocate_button_action` below to resolve a `Bookmark`
+    action's `destination` to a bookmark that actually exists in the
+    project, instead of leaving the LLM's raw Qlik-side id/title in place
+    (which would point at nothing).
 
     `custom_theme` (see build/theme.py) is a Power BI Report Theme JSON
     built from the source Qlik app's own extracted color palette — when
@@ -327,7 +443,21 @@ def write_report(report_dir: str, pages: list[dict], *, app_name: str, custom_th
         # to for anything the custom theme's own (deliberately minimal —
         # just name + dataColors) JSON doesn't specify itself.
         theme_name = custom_theme["name"]
-        theme_filename = f"{_safe(theme_name)}.json"
+        # The FILE name deliberately does NOT embed the app name (unlike
+        # `theme_name`, which still carries it for display in Desktop's
+        # theme picker) — a long app name here (e.g. "NorthStar FoodMart —
+        # Regional Sales Performance Analytics 1") produces a long
+        # filename that, nested 5 levels under an output path that already
+        # repeats the app name twice (.../output/<app>/<app>.Report/
+        # StaticResources/RegisteredResources/<app>_Theme.json), pushed the
+        # full path past Windows' 260-character MAX_PATH limit in
+        # practice ("Cannot read ... The specified path, file name, or
+        # both are too long"). There's exactly one theme file per report,
+        # so it needs no app-derived content to stay unique within its own
+        # RegisteredResources folder — a short, constant name sidesteps
+        # this whole class of bug regardless of how long a future app's
+        # name is.
+        theme_filename = "Theme.json"
         registered_dir = os.path.join(report_dir, "StaticResources", "RegisteredResources")
         os.makedirs(registered_dir, exist_ok=True)
         with open(os.path.join(registered_dir, theme_filename), "w", encoding="utf-8") as f:
@@ -432,9 +562,10 @@ def write_report(report_dir: str, pages: list[dict], *, app_name: str, custom_th
             # writing into it writes into the right place.
             if isinstance(visual.get("visualContainerObjects"), dict) and isinstance(inner_visual, dict):
                 inner_visual["visualContainerObjects"] = visual["visualContainerObjects"]
-            _relocate_button_action(inner_visual)
+            _relocate_button_action(inner_visual, bookmark_lookup)
             _relocate_footer_to_subtitle(inner_visual)
             _sanitize_visual_extra_keys(visual, inner_visual)
+            _relocate_unknown_visual_keys(inner_visual)
             if name_map:
                 visual_json = _rewrite_name_refs(visual_json, name_map)
                 visual_json["name"] = visual_id  # never let a ref-rewrite touch our own key

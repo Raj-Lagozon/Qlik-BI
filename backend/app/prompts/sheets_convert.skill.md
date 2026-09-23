@@ -758,9 +758,19 @@ to emit for a button, do not construct `visualContainerObjects`/`general`/
 `visualType`/`objects` live on) — never nested inside `objects`, and never
 nested inside a hand-built `visualContainerObjects`. `buttonText` is a
 plain string (the builder wraps it in the DAX-literal form itself). Action
-`"type"` values: `"PageNavigation"` (destination: a page name),
+`"type"` MUST be exactly one of these 5 strings — never any other value,
+and never a placeholder like `"None"`/`"none"`/`"N/A"` for a button with no
+real navigation: `"PageNavigation"` (destination: a page name),
 `"Bookmark"` (destination: a bookmark name/guid), `"WebUrl"` (destination:
-the URL string), `"Drillthrough"`, `"QnA"`.
+the URL string), `"Drillthrough"`, `"QnA"`. **If the source Qlik button/
+object has no real navigation action, omit the `action` key entirely** —
+do not invent one. A real, confirmed Power BI Desktop crash (not just a
+load-time rejection) happens when `visualLink.type` is any string outside
+this exact set: Desktop's own renderer looks the type up in an internal
+label table when building the visual's tooltip and crashes with "Cannot
+read properties of undefined (reading 'displayName')" the moment that
+visual is shown — this corrupts the WHOLE report render, not just that
+button.
 
 **`confidence` and `notes` are top-level siblings of `visual` — one level
 up from it, on the SAME visual entry, never keys inside `visual` itself —
@@ -1263,8 +1273,8 @@ multi-value fields).
 | `Pick()` | `SWITCH()` (index form) / a `SWITCH(TRUE(), ...)` chain | Qlik's `Pick(n, v1, v2, ...)` selects positionally; DAX has no positional-index `SWITCH`, must use `SWITCH(n, 1, v1, 2, v2, ...)`. |
 | `Match()` | `SWITCH()` / equality-chain comparison | Qlik's `Match()` returns the 1-based position of the first match (or 0); DAX must reconstruct that position explicitly if the ordinal result itself (not just a resulting value) is used downstream. |
 | `WildMatch()` | `CONTAINSSTRING()` / pattern-matching logic | Qlik wildcard matching (`*`/`?`) has no direct DAX equivalent function — needs decomposition into one or more `CONTAINSSTRING`/`SEARCH` calls depending on the pattern's complexity. |
-| `Alt()` | `COALESCE()` / explicit fallback `IF`/`ISBLANK` chain | Qlik's `Alt()` returns the first argument that is a valid number; `COALESCE()` returns the first non-blank — close but not identical (numeric-validity vs. blank-ness) and must be checked per use. |
-| `IsNull()` | `ISBLANK()` | Close, but Qlik NULL and DAX BLANK are not semantically identical in every context. |
+| `Alt()` | `COALESCE()` / explicit fallback `IF`/`ISBLANK` chain | Qlik's `Alt()` returns the first argument that is a valid number; `COALESCE()` returns the first non-blank — close but not identical (numeric-validity vs. blank-ness). If the source field can hold non-numeric junk (not just missing values), `COALESCE(field, 0)` is WRONG — use `IF(ISERROR(VALUE(field)), 0, VALUE(field))` instead, since `COALESCE` only guards blank/null, not "not a number." |
+| `IsNull()` | `ISBLANK()` | Safe as a direct mapping for the *test itself*, but two specific DAX-vs-Qlik divergences are real, verified, silent-bug traps once the result feeds arithmetic or a comparison — **never rely on default DAX blank-coercion to match Qlik's NULL propagation**: (1) **Arithmetic**: DAX `BLANK() + 5` evaluates to `5` (blank is the additive identity for `+`/`-`), whereas Qlik `NULL + 5` evaluates to `NULL`. Any Qlik expression that relies on NULL-propagating-through-`+`/`-` to suppress a result needs an explicit `IF(ISBLANK(x), BLANK(), x + 5)` guard in the DAX — `*`/`/` don't have this problem (`BLANK() * 5 = BLANK()`, matching Qlik). (2) **Equality**: DAX `BLANK() = BLANK()` evaluates to `TRUE`, whereas Qlik `NULL = NULL` evaluates to `NULL` (neither true nor false). Any Qlik `If(IsNull(x) and IsNull(y), ...)`-style guarded comparison needs an explicit `ISBLANK()` check on each side in the DAX rewrite, not a naive `x = y`, or two blank values will incorrectly compare equal. |
 | `Len()` | `LEN()` | Direct. |
 | `Left()` / `Right()` / `Mid()` | `LEFT()` / `RIGHT()` / `MID()` | Direct. |
 | `Upper()` / `Lower()` / `Trim()` | `UPPER()` / `LOWER()` / `TRIM()` | Direct. |
