@@ -84,6 +84,7 @@ same review-flagging every other task's `confidence` field does.
 - `LOAD ... RESIDENT TableA WHERE <cond>;` → `Table.SelectRows(TableA, each <cond as M predicate>)`.
 - `LOAD field1, field2 RESIDENT TableA;` (field subset) → `Table.SelectColumns(TableA, {"field1","field2"})`.
 - Multiple RESIDENT steps chaining off one table → nest as sequential `let` steps.
+- **Link-table pattern** (`TableName: LOAD ... RESIDENT Src1; CONCATENATE(TableName) LOAD ... RESIDENT Src2; ...` — a table built ENTIRELY from other already-loaded tables, no FROM/file of its own, unioning a shared set of association fields from several fact tables) is normally already handled deterministically by this tool's own Python build step (`project.py`'s `_detect_link_table_specs`), which generates a real `Table.Combine` over each source's own query — **you do not need to reproduce it yourself** for a table matching this exact shape. Only write your own `Table.Combine(...)`-based conversion for it if asked to convert this specific table in isolation outside that pipeline; never treat it as a table with its own file source (there is no `TableName.csv` to load from).
 
 ### CROSSTABLE
 `CROSSTABLE (AttributeField, DataField, N) LOAD key1, key2, col1, col2, ... FROM ...;`
@@ -145,6 +146,8 @@ most common bug risk in this conversion.
 
 ### Field-level transforms
 - `Date(field, 'format')` / `Num(field, 'format')` → wrap with `Table.TransformColumns(Source, {{"field", each Date.From(_), type date}})` (or `Number.From`). **Never** convert a `Num()`-style display-formatting call into a DAX `FORMAT()` function downstream (that belongs to the sheets task, not this one) — `Date()`/`Num()` here are read/type operations on the M side, not the final display formatting, which stays a numeric/date value with a separate format string applied at the model/visual level.
+- `Ceil(expr)` → `Number.RoundUp(expr, 0)` (Qlik's `Ceil` always rounds UP toward positive infinity, matching `Number.RoundUp`'s default behavior — do not use `Number.Round` with a rounding-mode argument, which rounds to nearest, not up).
+- A Qlik `LOAD ... RESIDENT Source WHERE ... GROUP BY key1, key2, ...` aggregation (summing/counting rows down to one row per group) → `Table.Group(Source, {{"key1", "key2"}}, {{{{"AggAlias", each Sum([Field]), type number}}, ...}})`. Every aggregate column in the field list needs its own `{{"alias", each <AggFunc>([Field]), type}}` entry; a plain (non-aggregated) field in the same LOAD that isn't one of the GROUP BY keys is invalid Qlik syntax and should never appear.
 - `Dual(text, num)` → keep the numeric column as the value; store `text` in a
   parallel display column if both are referenced downstream, otherwise drop
   the dual wrapper (Power BI has no native dual type — use format strings on
@@ -159,6 +162,40 @@ most common bug risk in this conversion.
   integer-assignment algorithm (Power BI relationships only need both sides
   to agree on one value, and a text key is easier to reproduce faithfully
   than the numeric ID Qlik happened to assign row-by-row during its own load).
+- `AutoNumberHash128(field1, field2, ...)` / `AutoNumberHash256(...)` — a
+  DIFFERENT function again from plain `AutoNumber()`. It computes a STABLE
+  HASH KEY from the COMBINATION of the listed fields — this is a real
+  COMPUTED value, never a column that exists in the source file. **Never
+  treat the LOAD's alias as a passthrough source column** — a real,
+  confirmed bug: doing so produces a `Table.SelectColumns(...)` that tries
+  to read the hash-key alias straight from the CSV, which doesn't have it,
+  so `MissingField.UseNull` silently fills every row with `null` — the key
+  column ends up entirely blank, and Power BI then rejects any relationship
+  built on it ("contains a duplicate value ... not allowed for columns on
+  the one side of a many-to-one relationship" — every row's `null` is a
+  duplicate of every other row's `null`). `AutoNumberHash128`/`256` is a
+  genuinely NUMERIC key in Qlik — reproduce it as a real number via ONE
+  shared M function called `fnHashKey` (a deterministic FNV-1a 32-bit
+  string hash), never an ad hoc `Text.Combine` inlined separately per
+  table: a hand-typed formula repeated at N call sites risks the tables
+  silently drifting out of agreement (a field-order/delimiter typo at just
+  one site breaks that table's relationship with no error at all), where a
+  single shared function called identically everywhere cannot drift.
+  ```
+  Computed = Table.AddColumn(Source, "Key_ProductZoneMonth", each
+      if [ProductID] = null or [Zone] = null or [MonthNum] = null then null
+      else fnHashKey({Text.From([ProductID]), Text.From([Zone]), Text.From([MonthNum])}))
+  ```
+  This tool's own build pipeline already reproduces this idiom
+  deterministically in Python whenever it recognizes the pattern (see
+  `project.py`'s `_detect_autonumberhash_keys`/`csv_m.py`'s `HASH_FUNCTION_NAME`)
+  — you do not need to hand-author it for a table that detector already
+  covers. Only write your own `fnHashKey(...)` call for a table/case that
+  detector doesn't reach; if you do, **call the exact same shared
+  `fnHashKey` function, with the SAME field order, on EVERY table that
+  computes this key** — never fall back to a locally-invented text
+  concatenation instead, and never rename or reimplement `fnHashKey` per
+  table.
 - Renames via `AS` → `Table.RenameColumns(Source, {{"OldName","NewName"}})`.
 - `RENAME FIELD OldName TO NewName;` (a standalone script statement, not an
   inline `AS`) → also `Table.RenameColumns(Source, {{"OldName","NewName"}})`,

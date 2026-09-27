@@ -11,6 +11,7 @@ import uuid
 from typing import Any
 
 from .report import write_platform_file
+from .csv_m import HASH_FUNCTION_NAME, hash_function_m_lines
 
 
 def _guid() -> str:
@@ -165,8 +166,9 @@ def write_semantic_model(
     if parameters:
         _write_parameters_table(tables_dir, parameters)
 
-    if source_data_parameter:
-        _write_expressions_tmdl(defn_dir, source_data_parameter)
+    needs_hash_function = any(HASH_FUNCTION_NAME in t.get("m_expression", "") for t in tables.values())
+    if source_data_parameter or needs_hash_function:
+        _write_expressions_tmdl(defn_dir, source_data_parameter, include_hash_function=needs_hash_function)
     else:
         _remove_if_exists(os.path.join(defn_dir, "expressions.tmdl"))
 
@@ -345,7 +347,9 @@ def _write_parameters_table(tables_dir: str, parameters: list[dict]) -> None:
         f.write("\n".join(lines))
 
 
-def _write_expressions_tmdl(defn_dir: str, source_data_parameter: dict) -> None:
+def _write_expressions_tmdl(
+    defn_dir: str, source_data_parameter: dict | None, include_hash_function: bool = False,
+) -> None:
     """A real, first-class Power Query Parameter (shown in Power BI
     Desktop's Manage Parameters dialog), written as a TMDL shared M
     expression. Every table's M references it by this same bare name
@@ -373,17 +377,27 @@ def _write_expressions_tmdl(defn_dir: str, source_data_parameter: dict) -> None:
             "",
         ]
 
-    lines = _text_param(source_data_parameter["name"], source_data_parameter["default_value"], True)
+    lines: list[str] = []
+    if source_data_parameter:
+        lines += _text_param(source_data_parameter["name"], source_data_parameter["default_value"], True)
 
-    # Optional SQL Server source. Empty SqlServer (the default) => every table
-    # stays on its CSV; set SqlServer + SqlDatabase in Manage Parameters and
-    # every table reads [SqlSchema].[<TableName>] from that database instead.
-    # Credentials are entered in Power BI on first refresh, not stored here.
-    sql = source_data_parameter.get("sql")
-    if sql:
-        lines += _text_param(sql["server_param"], "", False)
-        lines += _text_param(sql["database_param"], "", False)
-        lines += _text_param(sql["schema_param"], sql.get("schema_default", "dbo"), False)
+        # Optional SQL Server source. Empty SqlServer (the default) => every
+        # table stays on its CSV; set SqlServer + SqlDatabase in Manage
+        # Parameters and every table reads [SqlSchema].[<TableName>] from
+        # that database instead. Credentials are entered in Power BI on
+        # first refresh, not stored here.
+        sql = source_data_parameter.get("sql")
+        if sql:
+            lines += _text_param(sql["server_param"], "", False)
+            lines += _text_param(sql["database_param"], "", False)
+            lines += _text_param(sql["schema_param"], sql.get("schema_default", "dbo"), False)
+
+    if include_hash_function:
+        # A plain shared M function (not a parameter) — see
+        # csv_m.hash_function_m_lines's own docstring for why every table
+        # computing a Qlik AutoNumberHash128/256 key calls this SAME
+        # function by name instead of each inlining its own formula.
+        lines += hash_function_m_lines()
 
     with open(os.path.join(defn_dir, "expressions.tmdl"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -404,40 +418,41 @@ def _tmdl_qualify(table: str, column: str) -> str:
 
 
 def _render_relationships_tmdl(relationships: list[dict], calculated_tables: set[str] | None = None) -> str:
-    """Every relationship renders as a plain, un-asserted relationship —
-    TMDL's own default is many (fromColumn's table) to one (toColumn's
-    table), which is exactly correct star-schema shape as long as
-    from_table/to_table are assigned with the fact/many side as `from` and
-    the dimension/lookup side as `to` (both infer_relationships.py and the
-    data_model.skill.md conversion already follow that convention).
+    """Every relationship renders as a plain, un-asserted relationship by
+    DEFAULT — TMDL's own default is many (fromColumn's table) to one
+    (toColumn's table), which is exactly correct star-schema shape as long
+    as from_table/to_table are assigned with the fact/many side as `from`
+    and the dimension/lookup side as `to` (both infer_relationships.py and
+    the data_model.skill.md conversion already follow that convention).
 
-    This deliberately NEVER asserts one-to-one + bothDirections, even when
-    a relationship's source data happens to be unique on both sides.
-    Reasons, all confirmed hands-on in this project rather than theoretical:
-      - It's bad star-schema modeling regardless of Power BI mechanics — a
-        fact table related to anything (another fact table included) should
-        be the many side; genuinely 1:1 tables are usually a sign they
-        should be merged, not related.
-      - No real measure in this pipeline has ever needed the "reverse"
-        RELATED() direction 1:1 exists to enable — every RELATED() call
-        found in practice iterates the many side and reads the one side,
-        which plain many-to-one already supports with no cardinality
-        assertion needed.
-      - A statically-asserted 1:1 relationship into/out of a DAX calculated
-        table fails Power BI Desktop's static project-load validation
-        outright ("Relationship '<guid>' uses an invalid column ID <n>"),
-        regardless of crossFilteringBehavior — this happened with two
-        unrelated calculated tables (one using RELATED() in its own
-        expression, one a plain CALENDARAUTO()), so it isn't a narrow edge
-        case.
-      - Since .qvf row/record data is no longer extracted (only structure),
-        there's no real data left to verify a "the source proves this is
-        truly 1:1" claim against anyway — asserting it is just trusting an
-        LLM guess that has repeatedly turned out to be more trouble than
-        it's worth.
-    `calculated_tables` is accepted for backward compatibility with callers
-    but no longer changes behavior (nothing here still branches on it).
-    """
+    For most of this project's history this function NEVER asserted
+    one-to-one + bothDirections at all, even when a relationship's source
+    data happened to be unique on both sides — a statically-asserted 1:1
+    relationship into/out of a DAX CALCULATED table fails Power BI
+    Desktop's static project-load validation outright ("Relationship
+    '<guid>' uses an invalid column ID <n>"), confirmed with two unrelated
+    calculated tables (one using RELATED() in its own expression, one a
+    plain CALENDARAUTO()). That risk is real but SPECIFIC to calculated
+    tables, not to 1:1 relationships in general — a genuine
+    dimension-to-dimension relationship between two ordinary, real
+    (M-imported) tables, each unique on the shared key, has no such
+    conflict and is exactly what a real user asked this project to model
+    correctly (2026-09-24).
+
+    So: `fromCardinality`/`toCardinality`/`crossFilteringBehavior` (exact
+    TOM property names + camelCase enum values, verified against
+    Microsoft's own SingleColumnRelationship API reference and TMDL casing
+    rules this session) ARE now emitted, but ONLY when
+    `rel["cardinality"] == "one-to-one"` — which `infer_relationships.py`
+    only ever sets when BOTH sides of the pair are independently
+    highly-unique on the shared key AND neither table is calculated. The
+    `calculated_tables` check here is a second, independent guard against
+    the exact same failure mode (defense-in-depth, same philosophy as
+    every other "never trust a single check" pattern in this codebase) —
+    even if a caller's `cardinality` flag were ever wrong, a relationship
+    touching a calculated table can never render as 1:1+bothDirections
+    through this function."""
+    calculated_tables = calculated_tables or set()
     out = []
     for rel in relationships:
         out.append(f"relationship {_guid()}")
@@ -445,6 +460,31 @@ def _render_relationships_tmdl(relationships: list[dict], calculated_tables: set
         out.append(f"\ttoColumn: {_tmdl_qualify(rel['to_table'], rel['to_column'])}")
         if rel.get("is_active") is False:
             out.append("\tisActive: false")
+        is_safe_one_to_one = (
+            rel.get("cardinality") == "one-to-one"
+            and rel["from_table"] not in calculated_tables
+            and rel["to_table"] not in calculated_tables
+        )
+        # Many-to-many: infer_relationships.py sets this when Qlik's own
+        # associative engine ties two tables together on a shared field
+        # (its "keys" list) but NEITHER table's copy of that field is
+        # reliably unique per-table — asserting a many-to-one here (TMDL's
+        # unasserted default) would pick an arbitrary "one" side that isn't
+        # actually unique, which Analysis Services rejects outright at
+        # refresh time ("contains a duplicate value ... not allowed for
+        # columns on the one side of a many-to-one relationship") — a real,
+        # confirmed crash (AlertLog/LinkTable's shared Key_ProductZone,
+        # neither table unique on it). `many`/`many` has no such
+        # uniqueness requirement on either side.
+        is_many_to_many = rel.get("cardinality") == "many-to-many"
+        if is_safe_one_to_one:
+            out.append("\tfromCardinality: one")
+            out.append("\ttoCardinality: one")
+            out.append("\tcrossFilteringBehavior: bothDirections")
+        elif is_many_to_many:
+            out.append("\tfromCardinality: many")
+            out.append("\ttoCardinality: many")
+            out.append("\tcrossFilteringBehavior: bothDirections")
         out.append("")
     return "\n".join(out)
 

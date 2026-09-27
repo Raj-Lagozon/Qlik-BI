@@ -28,6 +28,86 @@ _TYPE_LITERAL = {"int64": "Int64.Type", "double": "type number"}
 
 _EXCEL_EXTENSIONS = (".xlsx", ".xlsm", ".xls")
 
+# Qlik's AutoNumberHash128/256(field1, field2, ...) produces a genuinely
+# NUMERIC composite key, not text — a real reader's feedback on this project
+# (2026-09-25) correctly pointed out that reproducing it as a delimited-text
+# Text.Combine (this file's earlier approach) is not a faithful migration of
+# "give me a unique NUMBER the way Qlik does", and that hand-writing the same
+# formula inline in every table risks the tables drifting out of agreement
+# over time (a field-order/delimiter typo in just one of N call sites would
+# silently break that table's relationship with no error at all). The fix
+# from both angles: ONE shared Power Query function (`fnHashKey`, written
+# once into expressions.tmdl by `hash_function_m_lines()` below and called
+# by name from every table that needs it — see `_computed_column_expr`'s
+# "HashKey" case), so there is exactly one formula to get right, referenced
+# identically everywhere, and it returns a real number (FNV-1a, a
+# well-known deterministic 32-bit string hash), not a text lookalike.
+# Power Query has no 128/256-bit hash primitive, so this is not
+# byte-for-bit identical to Qlik's own AutoNumberHash128 value — but a
+# relationship built on it only needs every table's OWN call to `fnHashKey`
+# to agree with every OTHER table's call for the SAME real-world key, which
+# a single shared function called with the same field list/order
+# guarantees exactly as reliably as Qlik's own per-app-session autonumbering
+# does (Qlik's own AutoNumberHash128 value isn't stable ACROSS different
+# Qlik apps/sessions either — only self-consistent within one).
+HASH_FUNCTION_NAME = "fnHashKey"
+
+
+def hash_function_m_lines() -> list[str]:
+    """The shared `fnHashKey` M function body, as a list of already-tab-
+    indented lines ready to splice into expressions.tmdl (semantic_model.py)
+    the same way SourceDataPath's parameter lines are built — a plain
+    shared Power Query function (not a parameter), takes a list of already-
+    stringified field values and returns one stable number. Written
+    UNCONDITIONALLY whenever the model has at least one HashKey-computed
+    column (see semantic_model.py's write_semantic_model), since it's a
+    hidden helper query, not something a person edits."""
+    return [
+        f"expression {HASH_FUNCTION_NAME} =",
+        "\t\t(parts as list) as number =>",
+        "\t\tlet",
+        '\t\t    Canonical = Text.Combine(List.Transform(parts, each Text.From(_)), "|"),',
+        '\t\t    Bytes = Binary.ToList(Text.ToBinary(Canonical, TextEncoding.Utf8)),',
+        "\t\t    Hashed = List.Accumulate(",
+        "\t\t        Bytes,",
+        "\t\t        2166136261,",
+        "\t\t        (state, b) => Number.BitwiseAnd(Number.BitwiseXor(state, b) * 16777619, 4294967295)",
+        "\t\t    )",
+        "\t\tin",
+        "\t\t    Hashed",
+        f"\tlineageTag: {_hash_function_guid()}",
+        "",
+        "\tannotation PBI_ResultType = Function",
+        "",
+    ]
+
+
+def _hash_function_guid() -> str:
+    import uuid
+    return str(uuid.uuid4())
+
+
+def inline_hash_function_into_m(m_expression: str) -> str:
+    """For the COMPILED `.pbix` path only (pbip-compiler has no concept of a
+    shared expression/parameter query at all — see project.py's
+    `_tables_with_inlined_source`, which already does the same thing for
+    `SourceDataPath`): if this table's M calls the shared `fnHashKey`
+    function, splice an IDENTICAL local copy of it into the top of this
+    table's own `let` block instead, so the call still resolves once the
+    real shared `expressions.tmdl` copy isn't carried into the compiled
+    model. No-op if this table doesn't use it at all."""
+    if HASH_FUNCTION_NAME not in m_expression or not m_expression.startswith("let\n"):
+        return m_expression
+    local_def = (
+        f'{HASH_FUNCTION_NAME} = (parts as list) as number => let '
+        'Canonical = Text.Combine(List.Transform(parts, each Text.From(_)), "|"), '
+        "Bytes = Binary.ToList(Text.ToBinary(Canonical, TextEncoding.Utf8)), "
+        "Hashed = List.Accumulate(Bytes, 2166136261, (state, b) => "
+        "Number.BitwiseAnd(Number.BitwiseXor(state, b) * 16777619, 4294967295)) "
+        "in Hashed"
+    )
+    return "let\n    " + local_def + ",\n" + m_expression[len("let\n"):]
+
 
 def _source_load_statement(filename: str, source_ref: str, sheet_name: str | None) -> str:
     """The M `Source = ...` step that opens `filename` (resolved against
@@ -207,6 +287,29 @@ def _computed_column_expr(spec: dict) -> str:
         # agree on ONE value, not specifically a number.
         a, b, sep = spec["field_a"], spec["field_b"], spec["sep"].replace('"', '""')
         return f'each if [{a}] = null or [{b}] = null then null else [{a}] & "{sep}" & [{b}]'
+    if func == "HashKey":
+        # Qlik's AutoNumberHash128(field1, field2, ...)/256(...) composite-
+        # key idiom (see project.py's _detect_autonumberhash_keys) is a
+        # genuinely NUMERIC key in Qlik, not text — reproduced here via the
+        # shared `fnHashKey` M function (see HASH_FUNCTION_NAME/
+        # hash_function_m_lines below), a real deterministic 32-bit hash
+        # (FNV-1a) over the same canonically-joined field values, so every
+        # table computing this key gets the SAME shape of value (a number),
+        # not an ad hoc per-call text concatenation. Every table computing
+        # the same key MUST call `fnHashKey` with the SAME field list, in
+        # the SAME order — enforced here since this is the one and only
+        # place any table's HashKey column is generated, never duplicated
+        # per table (see csv_m.HASH_FUNCTION_NAME's own docstring for why a
+        # single shared function, not an inlined formula, is required for
+        # every table to agree).
+        # Null-guarded the same way ConcatKey is above: if ANY component
+        # field is null, the whole key is null (a partial/incomplete key
+        # built by silently treating a null component as an empty string
+        # would look like a valid, distinct value and corrupt the
+        # relationship's row-matching rather than cleanly failing).
+        null_check = " or ".join(f"[{f}] = null" for f in spec["fields"])
+        fields_list = "{" + ", ".join(f"Text.From([{f}])" for f in spec["fields"]) + "}"
+        return f'each if {null_check} then null else {HASH_FUNCTION_NAME}({fields_list})'
     if func == "ApplyMapSubfield":
         # Qlik's SubField(ApplyMap('map', Field, 'default'), 'sep', N) —
         # look Field up in the mapping table (MapDict_<map>, built by
@@ -534,6 +637,127 @@ def generate_inline_partition_m(columns: list[dict], rows: list[dict[str, str]])
     return f"let\n    {body}\nin\n    {step}"
 
 
+def generate_resident_join_concat_partition_m(spec: dict) -> str:
+    """A table built from a Resident scratch table enriched by one or more
+    plain `left join(...) Resident Other` blocks, then collapsed to a
+    single computed `&`-concatenation column via `LOAD DISTINCT` (see
+    project.py's `_detect_resident_join_rename_specs` — real confirmed
+    case: Qlik's `ProductZone` table, `Gauge_Filter = Product & ' - ' &
+    Zone`, sourced from `LinkTable` left-joined with `Product`, with no
+    FROM/file of its own anywhere). Each source is referenced by its own
+    already-generated Power Query, same cross-query-reference approach as
+    `generate_concat_chain_partition_m`."""
+    base_select = ", ".join(f'"{f}"' for f in spec["base_fields"])
+    statements = [f'Base = Table.SelectColumns(#"{spec["base_source"]}", {{{base_select}}}, MissingField.UseNull)']
+    step = "Base"
+    for i, j in enumerate(spec["joins"]):
+        key_list = ", ".join(f'"{k}"' for k in j["join_key"])
+        select_list = ", ".join(f'"{f}"' for f in (j["join_key"] + j["carried_fields"]))
+        carried_list = ", ".join(f'"{f}"' for f in j["carried_fields"])
+        src_step = f"JoinSrc_{i}"
+        statements.append(f'{src_step} = Table.SelectColumns(#"{j["source"]}", {{{select_list}}}, MissingField.UseNull)')
+        joined_step = f"Joined_{i}"
+        statements.append(
+            f'{joined_step} = Table.NestedJoin({step}, {{{key_list}}}, {src_step}, {{{key_list}}}, '
+            f'"JoinCols_{i}", JoinKind.LeftOuter)'
+        )
+        expanded_step = f"Expanded_{i}"
+        statements.append(
+            f'{expanded_step} = Table.ExpandTableColumn({joined_step}, "JoinCols_{i}", '
+            f'{{{carried_list}}}, {{{carried_list}}})'
+        )
+        step = expanded_step
+
+    expr_parts = []
+    for t in spec["concat_tokens"]:
+        if t["kind"] == "literal":
+            lit = t["value"].replace('"', '""')
+            expr_parts.append(f'"{lit}"')
+        else:
+            expr_parts.append(f'Text.From([{t["value"]}])')
+    concat_expr = " & ".join(expr_parts)
+    col = spec["output_column"]
+    statements.append(f'Computed = Table.AddColumn({step}, "{col}", each {concat_expr})')
+    statements.append(f'Selected = Table.SelectColumns(Computed, {{"{col}"}})')
+    step = "Selected"
+    if spec.get("distinct"):
+        statements.append(f"Distincted = Table.Distinct({step})")
+        step = "Distincted"
+
+    body = ",\n    ".join(statements)
+    return f"let\n    {body}\nin\n    {step}"
+
+
+def generate_concat_chain_partition_m(spec: dict) -> str:
+    """A table the Qlik script builds ENTIRELY from other already-loaded
+    tables — no FROM/file source of its own at all — via a labeled
+    `TableName: LOAD ... RESIDENT Src1;` block followed by one or more
+    `CONCATENATE(TableName) LOAD ... RESIDENT Src2;` blocks (see project.py's
+    `_detect_link_table_specs`/`_detect_concat_resident_chains`; the Qlik
+    "link-table pattern" per Qlik_to_PowerBI_M_Conversion_Methodology.docx
+    sections 8/12/14). Each source is referenced by its own already-generated
+    Power Query — `Table.Combine` unions the SAME columns Qlik unions,
+    exactly like `generate_combined_partition_m` unions multiple FILES,
+    just with other queries as the union members instead. Composite keys
+    computed via AutoNumberHash128/256 (see csv_m._computed_column_expr's
+    "HashKey" case) are re-derived AFTER the union — not selected as if
+    they were real columns in each source — since they're 100% computed in
+    Qlik too, never stored data; `pre_distinct_hash_keys` are added before
+    the optional `Table.Distinct` dedup step (a `LOAD DISTINCT` naturally
+    dedups on the FULL row including any key computed earlier in that same
+    LOAD), `post_distinct_hash_keys` after it (a script's own follow-up
+    `NoConcatenate Final: LOAD DISTINCT ..., AutoNumberHash128(...) AS X
+    RESIDENT ChainTable;` computes X per already-deduped row)."""
+    sources = spec["sources"]
+    select_fields = spec["select_fields"]
+    select_list = ", ".join(f'"{f}"' for f in select_fields)
+    statements = []
+    ref_steps = []
+    for i, src in enumerate(sources):
+        step = f"Src_{i}_{_ident(src)}"
+        statements.append(f'{step} = Table.SelectColumns(#"{src}", {{{select_list}}}, MissingField.UseNull)')
+        ref_steps.append(step)
+    combine_list = ", ".join(ref_steps)
+    statements.append(f"Combined = Table.Combine({{{combine_list}}})")
+    step = "Combined"
+
+    for hk in spec.get("pre_distinct_hash_keys", []):
+        new_step = f'Computed_{_ident(hk["name"])}'
+        expr = _computed_column_expr({"func": "HashKey", "fields": hk["fields"]})
+        statements.append(f'{new_step} = Table.AddColumn({step}, "{hk["name"]}", {expr})')
+        step = new_step
+        # A row missing ANY of the key's component fields (a real, confirmed
+        # case: some source rows have a blank ProductID/Zone/MonthNum) gets
+        # a null key from the guard in `_computed_column_expr`'s "HashKey"
+        # case above — silently letting that null row through breaks the
+        # relationship built on this key at REFRESH time, not build time:
+        # "Column '<key>' ... contains blank values ... not allowed for
+        # columns on the one side of a many-to-one relationship" (Analysis
+        # Services rejects a blank on the "one" side just as strictly as a
+        # duplicate). Drop it here instead — Qlik's own associative model
+        # has the exact same effect for a null key (it never associates),
+        # so this loses nothing meaningful, just an unjoinable row.
+        filtered_step = f'Filtered_{_ident(hk["name"])}'
+        statements.append(f'{filtered_step} = Table.SelectRows({step}, each [{hk["name"]}] <> null)')
+        step = filtered_step
+
+    if spec.get("distinct"):
+        statements.append(f"Distincted = Table.Distinct({step})")
+        step = "Distincted"
+
+    for hk in spec.get("post_distinct_hash_keys", []):
+        new_step = f'Computed_{_ident(hk["name"])}'
+        expr = _computed_column_expr({"func": "HashKey", "fields": hk["fields"]})
+        statements.append(f'{new_step} = Table.AddColumn({step}, "{hk["name"]}", {expr})')
+        step = new_step
+        filtered_step = f'Filtered_{_ident(hk["name"])}'
+        statements.append(f'{filtered_step} = Table.SelectRows({step}, each [{hk["name"]}] <> null)')
+        step = filtered_step
+
+    body = ",\n    ".join(statements)
+    return f"let\n    {body}\nin\n    {step}"
+
+
 def generate_combined_partition_m(
     table_name: str,
     filenames: list[str],
@@ -682,6 +906,9 @@ def _extra_helper_columns(columns: list[dict], computed: dict[str, dict]) -> lis
         for key in ("field_a", "field_b", "source"):
             name = spec.get(key)
             if name and name not in declared and name not in extra:
+                extra.append(name)
+        for name in spec.get("fields", ()):  # HashKey's N-field list
+            if name not in declared and name not in extra:
                 extra.append(name)
     return extra
 

@@ -25,11 +25,11 @@ verified-safe bookmark that captures the target PAGE correctly but not yet
 the filter state. See PARTIALLY SUPPORTED note in `write_bookmarks`.
 
 Also unverified: whether Power BI Desktop requires a `bookmarks.json`
-index file (mirroring `pages/pages.json`) for bookmarks to appear in the
-Bookmarks pane, or discovers `*.bookmark.json` files by folder presence
-alone the way it does for other PBIR fragments. No index file is written
-here; if bookmarks don't appear in Desktop's Bookmarks pane after a build,
-that's the first thing to check.
+index file (mirroring `pages/pages.json`) for bookmarks to appear at all —
+**confirmed by a real user report**: Power BI Desktop refuses to open the
+whole project without it ("Cannot find file 'bookmarks/bookmarks.json'").
+`write_bookmarks` writes this index (schema verified against the real
+Fabric `bookmarksMetadata` schema) alongside the individual bookmark files.
 """
 
 from __future__ import annotations
@@ -86,12 +86,30 @@ def write_bookmarks(report_dir: str, bookmarks: list[dict], page_order: list[str
     lookup: dict[str, str] = {}
     taken: set[str] = set()
     written = 0
+    index_names: list[str] = []
     for bm in bookmarks:
         title = bm.get("title") or bm.get("id") or "Bookmark"
         raw_id = bm.get("id") or title
         pbi_name = _bounded_bookmark_name(raw_id, taken)
 
         active_page = bm.get("sheet_id") if bm.get("sheet_id") in page_order else page_order[0]
+
+        # Per-visual hide state (verified against the real Fabric bookmark
+        # schema this session — SectionState.visualContainers.<name>.
+        # singleVisual.display.mode, with "hidden" as one of exactly 4
+        # allowed values: maximize/spotlight/elevation/hidden). Used for
+        # container-tab emulation (see project.py's
+        # _generate_container_tab_bookmarks): a tab's bookmark hides every
+        # OTHER child in the same Qlik container, leaving only its own
+        # child visible — the closest faithful reproduction of Qlik's
+        # single-active-tab container behavior Power BI's bookmark
+        # mechanism supports. A visual not listed here is left at its
+        # normal (visible) state — there is no explicit "visible" mode,
+        # only "hidden", so simply omitting a visual is how it stays shown.
+        visual_containers = {
+            name: {"singleVisual": {"display": {"mode": "hidden"}}}
+            for name in bm.get("hidden_visuals", [])
+        }
 
         bookmark_json = {
             "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/bookmark/1.0.0/schema.json",
@@ -101,13 +119,14 @@ def write_bookmarks(report_dir: str, bookmarks: list[dict], page_order: list[str
                 "version": "1.0",
                 "activeSection": active_page,
                 "sections": {
-                    active_page: {"visualContainers": {}},
+                    active_page: {"visualContainers": visual_containers},
                 },
             },
         }
         with open(os.path.join(bookmarks_dir, f"{pbi_name}.bookmark.json"), "w", encoding="utf-8") as f:
             json.dump(bookmark_json, f, indent=2)
         written += 1
+        index_names.append(pbi_name)
 
         if bm.get("id"):
             lookup[bm["id"].casefold()] = pbi_name
@@ -121,5 +140,19 @@ def write_bookmarks(report_dir: str, bookmarks: list[dict], page_order: list[str
                   f"and re-save this bookmark if exact filter-state parity is needed.")
 
     if written:
-        print(f"[build] wrote {written} bookmark(s) -> {bookmarks_dir}")
+        # Confirmed real bug (user report): Power BI Desktop refuses to
+        # open the project at all without this index file ("Cannot find
+        # file 'bookmarks/bookmarks.json'") — it is NOT optional the way
+        # this module's docstring originally (incorrectly) speculated.
+        # Schema verified against the real Fabric bookmarksMetadata schema:
+        # {"$schema": ..., "items": [{"name": "<bookmark name>"}, ...]} —
+        # a flat list is sufficient (grouping via BookmarkGroupMetadata is
+        # optional and not needed here).
+        index_json = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/bookmarksMetadata/1.0.0/schema.json",
+            "items": [{"name": name} for name in index_names],
+        }
+        with open(os.path.join(bookmarks_dir, "bookmarks.json"), "w", encoding="utf-8") as f:
+            json.dump(index_json, f, indent=2)
+        print(f"[build] wrote {written} bookmark(s) + bookmarks.json index -> {bookmarks_dir}")
     return lookup

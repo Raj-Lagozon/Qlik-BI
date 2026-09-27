@@ -197,6 +197,39 @@ Qlik set analysis `{<Field={'Value'}>}` inside an aggregation becomes a DAX
   than 1 DAX trick, and note it in `"description"`. (See also "Alternate
   states used directly in a formula" below.)
 
+### Set-analysis modifier is a Qlik VARIABLE (`{<$(vSomeVar)>}`)
+A real, confirmed bug class (user report, `Control_Tower_v2`): a set-analysis
+modifier is sometimes not a literal condition but an entire Qlik **variable**
+substituted in via dollar-sign expansion, e.g. `Avg({<$(vCurrMonthSet)>}
+SafetyStockUnits)`. **Never convert this to a placeholder bracket reference**
+like `CALCULATE(AVERAGE(...), [vCurrMonthSet])` — `vCurrMonthSet` is not a
+DAX measure and never will be one, so `[vCurrMonthSet]` resolves to nothing
+("The value for '...' cannot be determined") and — because Analysis Services
+processes/recalculates measures transactionally across the WHOLE refresh —
+ONE such broken measure fails every other table's refresh too, not just
+this one. This has actually happened in production output; it is not a
+theoretical risk.
+
+Instead: **look up the variable's real definition** in the `variables`
+extraction (same lookup `script_conversion.skill.md`'s "Variable holding a
+full set-analysis expression" rule already documents for the load-script
+side) and inline its ACTUAL resolved filter conditions directly into the
+`CALCULATE` arguments, exactly as if the modifier had been written out
+literally in the first place:
+```
+-- vCurrMonthSet's definition: ={<Year={2026}, Month={9}>}
+-- Avg({<$(vCurrMonthSet)>}SafetyStockUnits)
+--   → CALCULATE(AVERAGE(InventoryFact[SafetyStockUnits]), InventoryFact[Year] = 2026, InventoryFact[Month] = 9)
+```
+If the variable's definition genuinely cannot be resolved (script not
+available, definition itself references something unresolvable), **omit
+that filter argument entirely** rather than inventing a placeholder —
+`CALCULATE(AVERAGE(InventoryFact[SafetyStockUnits]))` is a working measure
+with a broader result; a bracket reference to nothing is not. Mark
+`"confidence": "low"` and explain in `"notes"` which variable couldn't be
+resolved and why, so a person can fix the filter by hand — never silently
+guess and never leave an unresolvable bracket reference in the output DAX.
+
 ### Dynamic date-range idioms (MTD / QTD / YTD / rolling window)
 A very common Qlik pattern builds BOTH bounds of a date filter from
 `max(Date)` inside the set analysis string itself, via `$(=...)`
@@ -555,6 +588,20 @@ display name so chart axis labels in Power BI match Qlik's dimension labels.
 
 # Task C: Sheets → PBIR Pages / Visuals
 
+**Never truncate or summarize the visuals array — every object in the
+input must produce a real, complete visual entry, with no exceptions for
+a long or repetitive batch (e.g. a container with many near-identical
+small tiles).** A real, confirmed bug: a batch response once ended with a
+placeholder entry instead of fully enumerating every visual —
+`{"name": "... (additional KPI and button visuals omitted for
+brevity) ..."}`, with no `visual` key at all. That entry has no
+`visualType`, which is a REQUIRED PBIR property — Power BI Desktop refused
+to open the WHOLE report over it ("Required property 'visualType' was not
+included in the /visual property"), not just that one object. If a batch
+is large, still convert every single object individually and completely —
+never emit a summarizing sentence, an ellipsis, or a "see above" shorthand
+in place of a real visual entry.
+
 ## Input you receive
 One entry from `sheets.json` (`id`, `title`, `objects[]` — each with `type`,
 `bounds {x,y,width,height}`, `layout.properties`, `layout.layout`), the DAX
@@ -711,7 +758,7 @@ row/col spans instead of pixels. Normalize:
 | `sn-grid-chart` (native Qlik grid/matrix chart — dimensions down the rows, measures across columns, like a lightweight pivot) | `tableEx` if it has one dimension, `pivotTable` if it has more than one row dimension or any column dimension — same shape reasoning as `table`/`pivot-table` above |
 | `text-image` | `textbox` |
 | `sn-table` (native Sense table) | `tableEx` |
-| `button` (selection/variable-change/navigation/open-URL/trigger action) | button visual (page navigation / bookmark / drillthrough / web URL / Q&A) — classify per ACTION TYPE, not as one blanket mapping: a Qlik selection/variable-set action has no direct Power BI button-action equivalent (approximate with a bookmark capturing the equivalent filter state); "open URL"/"navigate to sheet" map cleanly to Power BI's web-URL/page-navigation actions — see the exact output shape below |
+| `button` (selection/variable-change/navigation/open-URL/trigger action) | **drop the object entirely — do not emit an `actionButton` visual for it.** Button/action visuals are not reproduced by this pipeline; omit the object from the output rather than emitting a button (with or without a real action). |
 | Show/Hide or Enable condition on any object | not a visual type — see "Conditional visibility" below |
 
 **Determining orientation for `barchart`/`combochart`**: read
@@ -726,51 +773,16 @@ explicitly set to `orientation: "horizontal"` converted into a vertical
 property at all. This applies to `combochart` too whenever it degrades
 to the plain bar/column case above (1 measure, no real combo).
 
-**A button's `action` and its label (`buttonText`) are simple keys directly
-inside `visual`, alongside `visualType`/`objects` — and don't try to
-hand-author the real PBIR `visualLink` schema yourself.** There is no
-`action` or `buttonText` property anywhere in the real Fabric PBIR schema
-at all — the actual container-level property for navigation is
-`visualLink` (fields `type`, `bookmark`, `webUrl`, `navigationSection`,
-`drillthroughSection`, `qna`, each a DAX-literal-quoted value, nested under
-`visual.visualContainerObjects`), and there is no schema property at all
-for a button's label under `visualContainerObjects` either — it belongs in
-`visual.objects.text[0].properties.text`, a visual-TYPE-SPECIFIC property,
-not a container one. Getting that exact shape right from scratch is
-error-prone, so instead emit the simple shape below and the builder
-(modules/build/report.py's `_relocate_button_action`) deterministically
-translates it into the real schema on your behalf — this is the ONLY shape
-to emit for a button, do not construct `visualContainerObjects`/`general`/
-`visualLink` yourself for it:
-```json
-{
-  "name": "<visual id>",
-  "position": {...},
-  "visual": {
-    "visualType": "actionButton",
-    "objects": {},
-    "action": {"type": "PageNavigation", "destination": "<PageId>"},
-    "buttonText": "Collections Strategy Simulator"
-  }
-}
-```
-`action` and `buttonText` are direct keys of `visual` (the same object
-`visualType`/`objects` live on) — never nested inside `objects`, and never
-nested inside a hand-built `visualContainerObjects`. `buttonText` is a
-plain string (the builder wraps it in the DAX-literal form itself). Action
-`"type"` MUST be exactly one of these 5 strings — never any other value,
-and never a placeholder like `"None"`/`"none"`/`"N/A"` for a button with no
-real navigation: `"PageNavigation"` (destination: a page name),
-`"Bookmark"` (destination: a bookmark name/guid), `"WebUrl"` (destination:
-the URL string), `"Drillthrough"`, `"QnA"`. **If the source Qlik button/
-object has no real navigation action, omit the `action` key entirely** —
-do not invent one. A real, confirmed Power BI Desktop crash (not just a
-load-time rejection) happens when `visualLink.type` is any string outside
-this exact set: Desktop's own renderer looks the type up in an internal
-label table when building the visual's tooltip and crashes with "Cannot
-read properties of undefined (reading 'displayName')" the moment that
-visual is shown — this corrupts the WHOLE report render, not just that
-button.
+**Buttons are dropped, not converted (see the `button` row in the visual
+type mapping table above) — do not emit an `actionButton` visual, and do
+not emit an `action`/`buttonText` key on any visual, ever.** An earlier
+version of this pipeline did convert Qlik `button` objects into
+`actionButton` visuals; that support has been removed because it produced
+unwanted button/blank-textbox clutter on the report, so simply omit the
+object from the output instead. (`action`/`buttonText` were never real
+PBIR properties anyway — there is no schema property for either under
+`visual` or `visualContainerObjects`; Power BI's real per-visual navigation
+property is `visualLink`, which this pipeline no longer generates at all.)
 
 **`confidence` and `notes` are top-level siblings of `visual` — one level
 up from it, on the SAME visual entry, never keys inside `visual` itself —
@@ -806,9 +818,12 @@ reason `action`-inside-`visual` is above (`visual`'s only allowed keys are
 
 If a Qlik object type has no reasonable Power BI equivalent (e.g. a custom
 extension object) **and it has no `qHyperCubeDef` of its own** (no real
-dimensions/measures bound to it — a pure decorative/config extension), emit
-a `textbox` visual containing a note of the original object's title and
-type instead of dropping it silently.
+dimensions/measures bound to it — a pure decorative/config extension),
+**drop the object entirely.** Do not emit a placeholder/explanatory
+`textbox` in its place — an empty or note-only textbox left on the page is
+unwanted clutter, not a useful stand-in. Note the dropped object (id, title,
+type) in `"notes"` on the page-level response instead, so it's traceable
+without adding anything visible to the report.
 
 A `textbox`'s text is a `general` object's `properties.paragraphs`, never a
 top-level `objects.paragraphs` and never a bare `{"text": "..."}`:
@@ -838,13 +853,14 @@ the rendered text itself. Instead:
 - If the label has a static prefix (e.g. `"Last reload: "` before the
   dynamic part), keep just that static text and drop the unresolvable
   dynamic suffix entirely (`"Last reload:"`), OR
-- If the entire label is dynamic with no usable static portion, omit the
-  textbox's text (empty string) rather than inventing filler.
-Either way, put the real explanation and the original Qlik expression in
-`"notes"` (e.g. `"Original label used ReloadTime(), which has no Power BI
-equivalent — see the similarity doc §13; add a real value manually if
-needed"`) so a person knows why the label is shorter/blank, without ever
-showing them fabricated-looking text in the report itself.
+- If the entire label is dynamic with no usable static portion, **drop the
+  textbox visual entirely** rather than emitting one with blank/empty text —
+  an empty textbox is still unwanted clutter on the page.
+Either way (including the drop case), put the real explanation and the
+original Qlik expression in `"notes"` (e.g. `"Original label used
+ReloadTime(), which has no Power BI equivalent — see the similarity doc
+§13; object dropped"`) so a person knows why, without leaving a blank box
+in the report itself.
 
 If an unrecognized `type` string DOES carry a real `qHyperCubeDef` with
 dimensions/measures (a third-party or custom-branded chart extension built

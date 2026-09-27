@@ -80,7 +80,35 @@ def convert_report(app_name: str) -> list[str]:
                 print(f"[convert] WARNING: {label} — dropped {len(batch_visuals) - len(good_visuals)} "
                       f"malformed (non-object) entr{'y' if len(batch_visuals) - len(good_visuals) == 1 else 'ies'} "
                       f"from the LLM's response instead of crashing the whole batch")
-            merged_visuals.extend(good_visuals)
+
+            # A real, confirmed case: the LLM sometimes truncates a long
+            # batch response with a summarizing placeholder entry instead
+            # of fully enumerating every visual — seen verbatim: {"name":
+            # "... (additional KPI and button visuals omitted for
+            # brevity) ..."}, no "visual" key at all. This passes the
+            # isinstance(v, dict) check above (it genuinely IS a dict), so
+            # it silently reached report.py's PBIR writer as an EMPTY
+            # visual, missing the REQUIRED `visualType` property — Power BI
+            # Desktop refuses to open the whole report over it ("Required
+            # property 'visualType' was not included in the /visual
+            # property"), a different failure shape from every other
+            # "additional property" bug already defended against (this one
+            # is a MISSING required property, not an extra one). Drop any
+            # entry that isn't a real visual — no "visual" dict, or a
+            # "visual" dict with no visualType — the same way a non-dict
+            # entry is dropped above, rather than let a placeholder
+            # sentence reach the PBIR writer.
+            complete_visuals = [
+                v for v in good_visuals
+                if isinstance(v.get("visual"), dict) and v["visual"].get("visualType")
+            ]
+            if len(complete_visuals) != len(good_visuals):
+                dropped = len(good_visuals) - len(complete_visuals)
+                print(f"[convert] WARNING: {label} — dropped {dropped} visual entr{'y' if dropped == 1 else 'ies'} "
+                      f"with no real 'visual'/'visualType' content (the LLM likely truncated the batch with a "
+                      f"summarizing placeholder like '... omitted for brevity ...' instead of fully enumerating "
+                      f"every visual) instead of shipping an incomplete visual that would reject the whole report")
+            merged_visuals.extend(complete_visuals)
 
         result = {"page": merged_page or {}, "visuals": merged_visuals}
         collect_confidence("report_visuals", result["visuals"])

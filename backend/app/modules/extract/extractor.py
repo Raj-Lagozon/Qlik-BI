@@ -62,6 +62,8 @@ def extract_app(
             session.open_doc(app_id)
             _reload_doc(session)
 
+            app_properties = _get_app_properties(session)
+
             script = _get_script(session)
             _write_text(out_dir, "script.qvs", script)
 
@@ -94,7 +96,7 @@ def extract_app(
                 names = ", ".join(k["table"] for k in kpi_containers)
                 print(f"[extract] detected KPI container config table(s): {names}")
 
-            theme = _get_theme(session, variables, sheets)
+            theme = _get_theme(session, variables, sheets, app_properties)
             _write_json(out_dir, "theme.json", theme)
             if theme["colors"]:
                 print(f"[extract] detected {len(theme['colors'])} theme color(s) "
@@ -114,7 +116,9 @@ def extract_app(
             except Exception as exc:
                 print(f"[extract] WARNING: could not delete app {app_id}: {exc}")
 
-    _write_json(out_dir, "meta.json", {"app_name": app_name, "app_id": app_id if keep_app else None})
+    _write_json(out_dir, "meta.json", {
+        "app_name": app_name, "app_id": app_id if keep_app else None, "properties": app_properties,
+    })
     print(f"[extract] done -> {out_dir}")
     return app_name
 
@@ -201,7 +205,23 @@ def _get_data_model_with_retry(session: EngineSession, script: str) -> dict:
 _HEX_COLOR_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
 
 
-def _get_theme(session: EngineSession, variables: list[dict], sheets: list[dict]) -> dict:
+def _get_app_properties(session: EngineSession) -> dict:
+    """The full, unfiltered result of Qlik's own `GetAppProperties` Engine
+    API call — title/description/theme/dynamicColor/last-reload timestamp
+    and whatever else this Qlik Cloud tenant's API version returns, written
+    verbatim into meta.json rather than hand-picking a fixed subset of keys
+    (which would silently drop real app metadata a future consumer might
+    want, and require a code change every time Qlik adds a new property).
+    Returns {} on failure (never raises) — every caller already treats an
+    empty/missing value as "not available" rather than a hard requirement."""
+    try:
+        return session.doc_call("GetAppProperties", []) or {}
+    except Exception as exc:
+        print(f"[extract] WARNING: could not read app properties via GetAppProperties: {exc}")
+        return {}
+
+
+def _get_theme(session: EngineSession, variables: list[dict], sheets: list[dict], app_properties: dict) -> dict:
     """Qlik's own branding/palette, recovered two ways (neither requires
     pulling any business row data):
 
@@ -226,12 +246,7 @@ def _get_theme(session: EngineSession, variables: list[dict], sheets: list[dict]
        `dataColors` palette (see project.py/report.py).
 
     Returns {"app_theme_name": str | None, "colors": [<hex>, ...]}."""
-    app_theme_name = None
-    try:
-        props = session.doc_call("GetAppProperties", [])
-        app_theme_name = (props.get("theme") or "").strip() or None
-    except Exception as exc:
-        print(f"[extract] WARNING: could not read app theme via GetAppProperties: {exc}")
+    app_theme_name = (app_properties.get("theme") or "").strip() or None
 
     colors: list[str] = []
     seen: set[str] = set()

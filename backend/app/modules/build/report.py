@@ -274,6 +274,21 @@ def _sanitize_visual_extra_keys(visual: dict, inner_visual: dict) -> None:
     if isinstance(query, dict) and "objects" in query:
         misplaced_objects = query.pop("objects")
         inner_visual.setdefault("objects", misplaced_objects)
+    if isinstance(query, dict) and "visualContainerObjects" in query:
+        # Same misplacement as `objects` right above, one level further —
+        # `query`'s only allowed key is `queryState`; a real confirmed
+        # crash had the LLM nest `visualContainerObjects` (a CONTAINER-level
+        # bag, see the title/subTitle case below) INSIDE `query` instead
+        # ("An additional property 'visualContainerObjects' was included in
+        # the /visual/query property"). Relocate it up to `inner_visual`
+        # (its real home, alongside `visualType`/`query`/`objects`) without
+        # clobbering one already placed correctly there.
+        misplaced_vco = query.pop("visualContainerObjects")
+        if isinstance(misplaced_vco, dict):
+            existing_vco = inner_visual.setdefault("visualContainerObjects", {})
+            if isinstance(existing_vco, dict):
+                for key, value in misplaced_vco.items():
+                    existing_vco.setdefault(key, value)
 
     inner_objects = inner_visual.get("objects")
     if isinstance(inner_objects, dict):

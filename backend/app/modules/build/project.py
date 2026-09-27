@@ -16,12 +16,14 @@ import tempfile
 from app.setting import settings
 
 from .semantic_model import write_semantic_model
-from .report import write_report
+from .report import write_report, _MAX_VISUAL_NAME
 from .theme import load_theme, build_custom_theme
 from .pbix_compile import compile_pbix
 from .csv_m import (
     generate_partition_m, generate_combined_partition_m, generate_inline_partition_m,
     wrap_with_left_join_aggregation, generate_groupby_count_partition_m,
+    generate_concat_chain_partition_m, generate_resident_join_concat_partition_m,
+    inline_hash_function_into_m,
 )
 from .infer_relationships import infer_relationships
 from .what_if_params import detect_what_if_parameters, generate_range_m
@@ -252,14 +254,16 @@ def _build_project_impl(app_name: str) -> str:
 
     # A Qlik KPI can be a hard-coded constant wrapped in Sum() (e.g.
     # "=Sum(5)") — a common idiom for a static target/placeholder tile, not
-    # a real aggregation over any field. report_visuals recognizes this (it
+    # a real aggregation over any field; report_visuals recognizes this (it
     # says so in the visual's own "notes": "Placeholder measure 'Sum5'
-    # (value=5)") but still binds the visual to a FABRICATED table
-    # ("MeasureTable") and measure name that exist nowhere in the model —
-    # Power BI reports that as "Fields that need to be fixed". Give the
-    # fabricated measure name a real, constant-valued DAX measure so the
-    # existing binding resolves naturally instead of pointing at nothing.
-    _synthesize_placeholder_constant_measures(pages, tables, measures_by_table, original_measure_table)
+    # (value=5)"). Explicit user instruction (2026-09-25): don't build this
+    # at all — not as a synthesized constant measure (an earlier version of
+    # this function DID that, purely to stop the visual showing "Fields
+    # that need to be fixed"), and not as a visual either. A KPI tile whose
+    # entire content is a hardcoded number is never real business data, the
+    # same reasoning already applied to the `=Sum(5)`-style ad-hoc-measure
+    # case (`_is_trivial_constant_measure`) — drop the whole tile.
+    _drop_placeholder_constant_kpis(pages)
 
     # A Qlik "Last reload"/ReloadTime() KPI has no field in the .qvf script
     # to bind to (it's a Qlik system value, not stored data) — deliberately
@@ -314,6 +318,7 @@ def _build_project_impl(app_name: str) -> str:
     _fix_measure_self_references(measures_by_table, calc_cols_by_table, tables)
     _wrap_bare_measure_refs(measures_by_table, calc_cols_by_table, original_measure_table)
     _fix_phantom_table_refs(measures_by_table, calc_cols_by_table, tables)
+    _fix_unresolved_bare_bracket_refs(measures_by_table, calc_cols_by_table, tables)
 
     # Deterministic last line of defence against the single most common
     # cause of "opens with errors": a numeric aggregation (SUM/AVERAGE/...)
@@ -440,7 +445,14 @@ def _build_project_impl(app_name: str) -> str:
         enable_real_parameters()
         literal = '"' + source_data_path.replace('"', '""') + '"'
         queue_parameter("SourceDataPath", literal, default_value=source_data_path)
-        tables_for_compile = tables  # keep the real SourceDataPath reference, don't inline it
+        # fnHashKey is a shared expression too, and pbix_parameter_patch
+        # only carries the ONE queued parameter above into the compiled
+        # model — inline a local copy into any table that calls it, same
+        # as the non-experimental branch below does.
+        tables_for_compile = {
+            name: {**t, "m_expression": inline_hash_function_into_m(t.get("m_expression", ""))}
+            for name, t in tables.items()
+        }
         print(f"[build] PBIX_REAL_PARAMETERS=1: attempting to keep 'SourceDataPath' as a real "
               f"Power Query Parameter in the compiled .pbix (EXPERIMENTAL — verify it actually "
               f"opens in Power BI Desktop before trusting this).")
@@ -491,6 +503,15 @@ def _tables_with_inlined_source(tables: dict[str, dict], source_data_path: str) 
         m_expression = table.get("m_expression", "")
         if param_re.search(m_expression):
             m_expression = param_re.sub(lambda m: subst[m.group(1)], m_expression)
+        # Same reasoning as the parameter substitution above: pbip-compiler
+        # has no concept of a shared expression/helper query either, so a
+        # compiled .pbix table calling the shared `fnHashKey` function (see
+        # csv_m.py) by name would reference something that doesn't exist.
+        # Inline an identical local copy of it into this table's own `let`
+        # block instead — the .pbip project (opened directly in Power BI
+        # Desktop) still uses the single real shared expression; only the
+        # compiled .pbix gets a per-table copy.
+        m_expression = inline_hash_function_into_m(m_expression)
         out[table_name] = {**table, "m_expression": m_expression}
     return out
 
@@ -1083,15 +1104,294 @@ def _detect_resident_only_tables(script_text: str) -> dict[str, str]:
     return out
 
 
+_CONCAT_RESIDENT_BLOCK_RE = re.compile(
+    r"\bCONCATENATE\s*\(\s*(\w+)\s*\)\s*\r?\n?\s*(?:REPLACE\s+)?LOAD\s+"
+    r"((?:(?!;|\bFROM\b|\bRESIDENT\b).)*?)\bRESIDENT\s+(\w+)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_NOCONCAT_DISTINCT_RESIDENT_RE = re.compile(
+    r"\bNoConcatenate\b\s*\r?\n?\s*(\w+):\s*\r?\n?\s*(?:REPLACE\s+)?LOAD\s+DISTINCT\s+"
+    r"((?:(?!;|\bFROM\b|\bRESIDENT\b).)*?)\bRESIDENT\s+(\w+)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_DROP_TABLE_RE = re.compile(r"\bDROP\s+TABLE\s+(\w+)\s*;", re.IGNORECASE)
+_RENAME_TABLE_RE = re.compile(r"\bRENAME\s+TABLE\s+(\w+)\s+TO\s+(\w+)\s*;", re.IGNORECASE)
+
+
+def _detect_concat_resident_chains(script_text: str) -> dict[str, list[tuple[str, str]]]:
+    """{table_name: [(source_table, field_list), ...]} for a table built
+    ENTIRELY by unioning rows already loaded into OTHER tables — a labeled
+    `TableName: LOAD ... RESIDENT Src1;` block followed by one or more
+    `CONCATENATE(TableName) LOAD ... RESIDENT Src2;` blocks, with no FROM/
+    file source of its own anywhere (the Qlik "link-table pattern" — see
+    Qlik_to_PowerBI_M_Conversion_Methodology.docx's sections 8/12/14,
+    confirmed against Control_Tower_v2's real script.qvs: `LinkTable` is
+    built from exactly 5 such blocks, one per fact table sharing
+    ProductID/Zone/MonthNum). Ordered by script position. Only tables with
+    2+ blocks are returned — a single Resident block is the simpler
+    reshape/rename idiom `_detect_resident_only_tables` already handles,
+    and reusing that idiom's "borrow the source table's own CSV" strategy
+    here would silently read ONLY the first source's rows (confirmed real
+    bug: LinkTable ended up loading solely from DemandFact.csv, dropping
+    every row that should have come from the other 4 fact tables)."""
+    events: dict[str, list[tuple[int, str, str]]] = {}
+    for m in _RESIDENT_ONLY_TABLE_RE.finditer(script_text):
+        table_name, field_list, source_table = m.group(1), m.group(2), m.group(3)
+        if _RESIDENT_AGGREGATION_SIGNAL_RE.search(field_list):
+            continue
+        events.setdefault(table_name, []).append((m.start(), source_table, field_list))
+    for m in _CONCAT_RESIDENT_BLOCK_RE.finditer(script_text):
+        table_name, field_list, source_table = m.group(1), m.group(2), m.group(3)
+        if _RESIDENT_AGGREGATION_SIGNAL_RE.search(field_list):
+            continue
+        events.setdefault(table_name, []).append((m.start(), source_table, field_list))
+    out: dict[str, list[tuple[str, str]]] = {}
+    for table_name, items in events.items():
+        items.sort(key=lambda e: e[0])
+        if len(items) >= 2:
+            out[table_name] = [(src, fields) for _pos, src, fields in items]
+    return out
+
+
+def _split_plain_and_hash_fields(field_list: str) -> tuple[list[str], list[dict]]:
+    """Split a Resident-block field list into (plain passthrough field
+    names, AutoNumberHash128/256 computed-key specs) — shared by the
+    link-table detector below to tell "a real column to select from the
+    combined rows" apart from "a composite key to compute afterward"."""
+    plain: list[str] = []
+    hash_keys: list[dict] = []
+    for item in _split_top_level_commas(field_list):
+        item = item.strip()
+        if not item:
+            continue
+        hm = _AUTONUMBERHASH_KEY_RE.match(item)
+        if hm:
+            fields = [f.strip() for f in hm.group(1).split(",")]
+            hash_keys.append({"name": hm.group(2), "fields": fields})
+            continue
+        rm = _SIMPLE_RENAME_RE.match(item)
+        if rm:
+            plain.append(rm.group(4) or rm.group(5))
+            continue
+        bare = item.strip().strip('"').strip("[]").strip()
+        if re.match(r"^[A-Za-z_]\w*$", bare):
+            plain.append(bare)
+    return plain, hash_keys
+
+
+def _detect_link_table_specs(script_text: str) -> dict[str, dict]:
+    """Turns `_detect_concat_resident_chains`'s raw block list into a ready
+    M-generation spec, also absorbing the common Qlik follow-up: `NoConcatenate
+    Final: LOAD DISTINCT <fields incl. a secondary AutoNumberHash128 key>
+    RESIDENT <ChainTable>; DROP TABLE <ChainTable>; RENAME TABLE Final TO
+    <ChainTable>;` (deduplicate the unioned rows and derive one more
+    composite key from a SUBSET of the fields — confirmed real case:
+    `LinkTable_Final` dedups on `Key_ProductZoneMonth` and adds
+    `Key_ProductZone = AutoNumberHash128(ProductID, Zone)`, then the script
+    drops the original `LinkTable` and renames `LinkTable_Final` onto that
+    same name).
+
+    Returns {final_table_name: {"sources", "select_fields",
+    "pre_distinct_hash_keys", "distinct", "post_distinct_hash_keys",
+    "origin_table"}} keyed by whatever name the table has AFTER any
+    rename — i.e. the name it actually has in data_model.json/the model
+    being built, which is what every OTHER caller in this file looks
+    tables up by."""
+    chains = _detect_concat_resident_chains(script_text)
+    if not chains:
+        return {}
+    dropped_tables = {m.group(1) for m in _DROP_TABLE_RE.finditer(script_text)}
+    renames = {m.group(1): m.group(2) for m in _RENAME_TABLE_RE.finditer(script_text)}
+
+    finalize_by_source: dict[str, tuple[str, str]] = {}
+    for m in _NOCONCAT_DISTINCT_RESIDENT_RE.finditer(script_text):
+        final_label, field_list, source_table = m.group(1), m.group(2), m.group(3)
+        if source_table in chains:
+            finalize_by_source[source_table] = (final_label, field_list)
+
+    out: dict[str, dict] = {}
+    for chain_table, blocks in chains.items():
+        sources = [src for src, _fields in blocks]
+        select_fields, pre_hash_keys = _split_plain_and_hash_fields(blocks[0][1])
+
+        distinct = False
+        post_hash_keys: list[dict] = []
+        final_table_name = chain_table
+        finalize = finalize_by_source.get(chain_table)
+        if finalize:
+            final_label, final_field_list = finalize
+            _f_select, f_hash = _split_plain_and_hash_fields(final_field_list)
+            distinct = True
+            post_hash_keys = f_hash
+            if chain_table in dropped_tables and renames.get(final_label) == chain_table:
+                final_table_name = chain_table
+            else:
+                final_table_name = final_label
+
+        out[final_table_name] = {
+            "sources": sources,
+            "select_fields": select_fields,
+            "pre_distinct_hash_keys": pre_hash_keys,
+            "distinct": distinct,
+            "post_distinct_hash_keys": post_hash_keys,
+            "origin_table": chain_table,
+        }
+    return out
+
+
+_LEFT_JOIN_RESIDENT_RE = re.compile(
+    r"\bleft\s+join\s*\(\s*(\w+)\s*\)\s*\r?\n?\s*(?:REPLACE\s+)?LOAD\s+"
+    r"((?:(?!;|\bFROM\b|\bRESIDENT\b).)*?)\bRESIDENT\s+(\w+)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_LABELED_DISTINCT_RESIDENT_RE = re.compile(
+    r"\b(\w+):\s*\r?\n?\s*(?:REPLACE\s+)?LOAD\s+DISTINCT\s+"
+    r"((?:(?!;|\bFROM\b|\bRESIDENT\b).)*?)\bRESIDENT\s+(\w+)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONCAT_EXPR_AS_RE = re.compile(r"^\s*(.+?)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$", re.DOTALL)
+
+
+def _parse_qlik_concat_expr(expr_text: str) -> list[dict] | None:
+    """Tokenize a Qlik `&`-joined text-concatenation expression (e.g.
+    `Product&' - '&Zone`) into an ordered list of {"kind": "field"/
+    "literal", "value": ...} — or None if the expression isn't a pure
+    &-chain of bare field names and single-quoted literals (a function
+    call, arithmetic operator, etc. is out of scope for this narrow
+    detector; the table is then left to whatever existing fallback
+    already applies, never silently mistranslated)."""
+    tokens = [t.strip() for t in expr_text.split("&")]
+    parts: list[dict] = []
+    for t in tokens:
+        if not t:
+            return None
+        if t.startswith("'") and t.endswith("'") and len(t) >= 2:
+            parts.append({"kind": "literal", "value": t[1:-1]})
+        elif re.match(r"^[A-Za-z_]\w*$", t):
+            parts.append({"kind": "field", "value": t})
+        else:
+            return None
+    return parts or None
+
+
+def _detect_resident_join_rename_specs(script_text: str) -> dict[str, dict]:
+    """A different Qlik "no FROM source of its own" idiom from the
+    link-table CONCATENATE chain above — a scratch table built from a
+    single `Resident` block, enriched by one or more plain (non-
+    aggregating) `left join(Scratch) LOAD ... Resident Other;` blocks, then
+    collapsed into a brand-new final table name via `Final: LOAD DISTINCT
+    <a &-concatenation expression> AS Alias RESIDENT Scratch; DROP TABLE
+    Scratch;` (real confirmed case: Qlik's own
+    `Prod_Zone: LOAD ProductID, Zone RESIDENT LinkTable; left join
+    (Prod_Zone) LOAD ProductID, Product RESIDENT Product; ProductZone: LOAD
+    DISTINCT Product&' - '&Zone AS Gauge_Filter RESIDENT Prod_Zone; DROP
+    TABLE Prod_Zone;`). Left completely undetected, `ProductZone` has no
+    FROM/file of its own anywhere in the script, so the build fell back to
+    guessing `ProductZone.csv` — a file that was never going to exist
+    ("DataSource.NotFound: ... Could not find file ... ProductZone.csv").
+
+    Only recognizes the narrow, safe shape this real case has: exactly ONE
+    output column, computed as a plain `&`-chain of real (base or joined)
+    field names and string literals — anything wider (multiple output
+    columns, a non-concat expression) is left undetected rather than risk
+    a wrong translation; such a table falls through to whatever generic
+    handling already existed before this detector.
+
+    Returns {final_table_name: {"base_source", "base_fields", "joins":
+    [{"source", "join_key", "carried_fields"}, ...], "distinct",
+    "output_column", "concat_tokens", "origin_table"}}."""
+    scratch_first: dict[str, tuple[str, str]] = {}
+    for m in _RESIDENT_ONLY_TABLE_RE.finditer(script_text):
+        table_name, field_list, source_table = m.group(1), m.group(2), m.group(3)
+        if _RESIDENT_AGGREGATION_SIGNAL_RE.search(field_list):
+            continue
+        if table_name not in scratch_first:
+            scratch_first[table_name] = (source_table, field_list)
+
+    joins_by_scratch: dict[str, list[tuple[int, str, str]]] = {}
+    for m in _LEFT_JOIN_RESIDENT_RE.finditer(script_text):
+        scratch, field_list, source_table = m.group(1), m.group(2), m.group(3)
+        if _RESIDENT_AGGREGATION_SIGNAL_RE.search(field_list):
+            continue
+        joins_by_scratch.setdefault(scratch, []).append((m.start(), source_table, field_list))
+
+    dropped_tables = {m.group(1) for m in _DROP_TABLE_RE.finditer(script_text)}
+
+    out: dict[str, dict] = {}
+    for m in _LABELED_DISTINCT_RESIDENT_RE.finditer(script_text):
+        final_table, field_list, scratch = m.group(1), m.group(2), m.group(3)
+        if scratch not in scratch_first or scratch not in dropped_tables:
+            continue
+        base_source, base_field_list = scratch_first[scratch]
+        base_fields, base_hash = _split_plain_and_hash_fields(base_field_list)
+        if base_hash or not base_fields:
+            continue
+
+        joins: list[dict] = []
+        ok = True
+        for _pos, join_source, join_field_list in sorted(joins_by_scratch.get(scratch, []), key=lambda e: e[0]):
+            jfields, jhash = _split_plain_and_hash_fields(join_field_list)
+            if jhash or not jfields:
+                ok = False
+                break
+            join_key = [f for f in jfields if f in base_fields]
+            carried_fields = [f for f in jfields if f not in join_key]
+            if not join_key or not carried_fields:
+                ok = False
+                break
+            joins.append({"source": join_source, "join_key": join_key, "carried_fields": carried_fields})
+        if not ok:
+            continue
+
+        items = _split_top_level_commas(field_list)
+        if len(items) != 1:
+            continue
+        cm = _CONCAT_EXPR_AS_RE.match(items[0].strip())
+        if not cm:
+            continue
+        tokens = _parse_qlik_concat_expr(cm.group(1))
+        if not tokens:
+            continue
+        available = set(base_fields)
+        for j in joins:
+            available.update(j["carried_fields"])
+        if not all(t["kind"] != "field" or t["value"] in available for t in tokens):
+            continue
+
+        out[final_table] = {
+            "base_source": base_source,
+            "base_fields": base_fields,
+            "joins": joins,
+            "distinct": True,
+            "output_column": cm.group(2),
+            "concat_tokens": tokens,
+            "origin_table": scratch,
+        }
+    return out
+
+
 # A Qlik app's own in-application report-distribution/bursting
 # infrastructure — a recipient list, recipient groups, per-recipient
 # filters, an enabled/disabled flag per recipient/group — configures
 # QLIK'S reporting/NPrinting distribution feature itself, never business
 # data a Power BI report/model should reproduce as a table (this pipeline's
 # scope is producing the report/model, not an automated distribution
-# system). Matched by table NAME convention — every real-world example
-# seen uses the `DL_DISTRIBUTION...` prefix (DL_DISTRIBUTION_SVC_USERS_QCS,
-# DL_DISTRIBUTION_SVC_GROUPS_QCS, or a bare DL_DISTRIBUTION_<anything>).
+# system). PRIMARY detection is structural (see _DISTRIBUTION_TAG_PREFIX_RE
+# below — a table is skipped if ANY of its fields carries Qlik's own
+# DL_DISTRIBUTION_SVC__ tag, regardless of what the table itself is named),
+# since that's a real Qlik-language mechanism (`TAG FIELD ... with '...'`),
+# not a naming convention. This table-NAME prefix is kept only as a
+# secondary, cheap-to-check fallback for the (every real-world example seen
+# so far) case where the table also happens to follow the
+# `DL_DISTRIBUTION...` naming convention (DL_DISTRIBUTION_SVC_USERS_QCS,
+# DL_DISTRIBUTION_SVC_GROUPS_QCS, ...) but a script tab was truncated/edited
+# such that the TAG FIELD statements themselves weren't captured — it is
+# NEVER the only signal an app can be recognized by (a real generalization
+# bug, fixed 2026-09-25: a differently-named distribution table with no tags
+# would previously not be recognized at all, and — just as important — a
+# table that legitimately happens to start with "DL_DISTRIBUTION" for an
+# unrelated business reason in some other app would previously always be
+# force-skipped by name alone).
 _DISTRIBUTION_TABLE_NAME_RE = re.compile(r"^DL_DISTRIBUTION", re.IGNORECASE)
 # Qlik's own tag namespace for a report-distribution field — `TAG FIELD
 # DL_DISTRIBUTION_EMAIL with 'DL_DISTRIBUTION_SVC__recipientEmail'` —
@@ -1121,6 +1421,54 @@ def _detect_report_distribution_tags(script_text: str) -> dict[str, str]:
         if _DISTRIBUTION_TAG_PREFIX_RE.search(tag):
             out[field_name] = tag
     return out
+
+
+# Qlik script constructs this pipeline has no dedicated conversion for —
+# genuinely used in production Qlik apps but absent from every sample app
+# this tool has been built/tested against so far. Per this project's own
+# migration rule (never silently generate incorrect/incomplete M for
+# something unhandled): detect each one and print a build-time WARNING
+# (automatically captured into MANUAL_REVIEW.md by _ManualReviewCapture —
+# any printed line containing "warning" is picked up with no extra
+# plumbing) rather than silently proceeding as if the construct weren't
+# there at all. Each entry is (compiled regex, human description); matched
+# case-insensitively against the raw script text, one warning per distinct
+# construct TYPE found (not per occurrence, to avoid drowning a real review
+# list in repeats).
+_UNSUPPORTED_SCRIPT_CONSTRUCTS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bSTORE\b[^;]*\bINTO\b", re.IGNORECASE | re.DOTALL),
+     "STORE ... INTO (exports a table to .qvd/.csv from WITHIN the script) — "
+     "has no Power Query equivalent (M reads data, it doesn't write files "
+     "mid-script); the STORE statement is skipped, the table it stores is "
+     "still converted normally if it's also used elsewhere."),
+    (re.compile(r"(?:^|;)\s*BINARY\b", re.IGNORECASE),
+     "BINARY LOAD (loads another compiled .qvf's data section directly) — "
+     "this pipeline extracts via a live Engine API session, which already "
+     "reflects the binary-loaded data merged into the running app's own "
+     "data model, so this is USUALLY a non-issue; only worth checking by "
+     "hand if a table from the binary-loaded app appears to be missing."),
+    (re.compile(r"\bGeneric\s+LOAD\b", re.IGNORECASE),
+     "Generic LOAD (Qlik's key-attribute-value pivot loader, produces one "
+     "synthetic table per distinct attribute) — not reproduced; the "
+     "resulting synthetic tables are converted as plain tables if extracted, "
+     "but the special generic-key association Qlik builds between them is "
+     "not recreated in the Power BI model."),
+    (re.compile(r"(?:^|;)\s*for\b.*?\bnext\b", re.IGNORECASE | re.DOTALL),
+     "FOR ... NEXT (script-level loop) — this pipeline converts the Qlik "
+     "data model as Qlik itself already resolved it (via a live Engine API "
+     "session), so a loop that only generates/reshapes LOAD statements is "
+     "typically a non-issue; only relevant if the loop has a side effect "
+     "(STORE, variable state used elsewhere) beyond the tables it builds."),
+    (re.compile(r"(?:^|;)\s*do\s+(?:while|until)\b", re.IGNORECASE),
+     "DO WHILE/UNTIL ... LOOP (script-level loop) — same reasoning as FOR/NEXT above."),
+)
+
+
+def _warn_unsupported_script_constructs(script_text: str) -> None:
+    for pattern, description in _UNSUPPORTED_SCRIPT_CONSTRUCTS:
+        if pattern.search(script_text):
+            print(f"[build] WARNING: script uses a construct this pipeline doesn't specially "
+                  f"handle — {description}")
 
 
 def _pairs_by_table_from_events(
@@ -1526,6 +1874,51 @@ _DUAL_AUTONUMBER_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# `AutoNumberHash128(field1, field2, ...)` / `AutoNumberHash256(...)` — a
+# DIFFERENT idiom from the Dual()+AutoNumber() one above: N bare field
+# names (no Dual() wrapper, no separator literal), directly as the hash
+# function's arguments. Same underlying bug class if left unhandled: the
+# target alias matches no real source column, loads as null for every row,
+# and (confirmed, real user report) breaks any relationship built on it
+# plus cancels refresh of the WHOLE model, not just this table.
+_AUTONUMBERHASH_KEY_RE = re.compile(
+    r"^\s*autonumberhash(?:128|256)\(\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*\)\s+[Aa][Ss]\s+([A-Za-z_]\w*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _detect_autonumberhash_keys(script_text: str) -> dict[str, dict[str, dict]]:
+    """Find every `AutoNumberHash128(field1, field2, ...) AS Target` /
+    `AutoNumberHash256(...)` field — sibling detector to
+    `_detect_dual_autonumber_keys` right above, for the N-ary
+    no-Dual()-wrapper form of the same composite-key idiom (real example:
+    `AutoNumberHash128(ProductID, Zone, MonthNum) as Key_ProductZoneMonth`).
+    Power Query has no 128/256-bit hash function, so this is reproduced as
+    a stable delimited-text combination of the same fields instead — a
+    relationship only needs both sides to agree on one value, not Qlik's
+    specific hash algorithm (see csv_m.py's "HashKey" case, and
+    script_conversion.skill.md's matching prompt-level rule for when this
+    same idiom needs to be reproduced consistently across MULTIPLE tables
+    that each compute the same key).
+
+    Returns {table_name: {target_field.casefold(): {"func": "HashKey",
+    "fields": [...]}}} — merged into the same `computed` dict the other
+    script-derived-column detectors feed."""
+    out: dict[str, dict[str, dict]] = {}
+    for block in _LOAD_BLOCK_RE.finditer(script_text):
+        table_name, field_list = block.group(1), block.group(2)
+        found: dict[str, dict] = {}
+        for item in _split_top_level_commas(field_list):
+            m = _AUTONUMBERHASH_KEY_RE.match(item)
+            if not m:
+                continue
+            fields = [f.strip() for f in m.group(1).split(",")]
+            target_field = m.group(2)
+            found[target_field.casefold()] = {"func": "HashKey", "fields": fields}
+        if found:
+            out[table_name] = found
+    return out
+
 
 def _detect_dual_autonumber_keys(script_text: str) -> dict[str, dict[str, dict]]:
     """Find every `dual(A & 'sep' & B, autonumber(A & 'sep' & B)) AS Target`
@@ -1745,6 +2138,8 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
     applymap_by_table: dict[str, dict[str, dict]] = {}
     crosstable_by_table: dict[str, dict] = {}
     resident_only_by_table: dict[str, str] = {}
+    link_table_specs_by_table: dict[str, dict] = {}
+    resident_join_specs_by_table: dict[str, dict] = {}
     distribution_tags: dict[str, str] = {}
     if os.path.exists(script_path):
         with open(script_path, encoding="utf-8") as f:
@@ -1754,6 +2149,7 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
         renamed_by_table = _detect_simple_renamed_columns(script_text)
         chr_concat_by_table = _detect_chr_concat_columns(script_text)
         dual_key_by_table = _detect_dual_autonumber_keys(script_text)
+        hash_key_by_table = _detect_autonumberhash_keys(script_text)
         source_files_by_table = _detect_source_files(script_text)
         source_sheets_by_table = _detect_source_sheets(script_text)
         expr_columns_by_table = _detect_expr_columns_per_file(script_text)
@@ -1764,7 +2160,32 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
         applymap_by_table = _detect_applymap_subfield_columns(script_text)
         crosstable_by_table = _detect_crosstable_specs(script_text)
         resident_only_by_table = _detect_resident_only_tables(script_text)
+        link_table_specs_by_table = _detect_link_table_specs(script_text)
+        resident_join_specs_by_table = _detect_resident_join_rename_specs(script_text)
         distribution_tags = _detect_report_distribution_tags(script_text)
+        _warn_unsupported_script_constructs(script_text)
+        # A table matched by the link-table (multi-way CONCATENATE) detector
+        # above must NEVER also be treated as a simple single-Resident
+        # reshape/rename by the hop-borrowing loop below — its FIRST block
+        # alone also matches `_detect_resident_only_tables` (same regex),
+        # which would otherwise make it silently borrow just that one
+        # source's CSV file, losing every row that should come from the
+        # other Concatenate(...)'d sources (the exact bug this detector
+        # exists to fix — see `_detect_concat_resident_chains`'s docstring).
+        _link_origin_tables = {spec["origin_table"] for spec in link_table_specs_by_table.values()}
+        for _origin in _link_origin_tables:
+            resident_only_by_table.pop(_origin, None)
+        # Same reasoning for the Resident+Join+rename idiom: the FINAL table
+        # name itself (e.g. `ProductZone`) also matches
+        # `_detect_resident_only_tables` (its own `LOAD DISTINCT ...
+        # Resident <Scratch>` block looks like a simple reshape/rename at a
+        # glance), which would otherwise send it down the hop-borrowing path
+        # — that path always fails to find a real file for it (the scratch
+        # table has none either), silently falling back to guessing
+        # "{table}.csv" (the exact real bug this fixes: "Could not find
+        # file ... ProductZone.csv").
+        for _final_table in resident_join_specs_by_table:
+            resident_only_by_table.pop(_final_table, None)
         # A table built purely via `Resident <OtherTable>` (see
         # _detect_resident_only_tables) has no FROM of its own — borrow
         # whatever file(s)/sheet(s) its Resident SOURCE table itself
@@ -1794,6 +2215,37 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                 if f.get("qName") or f.get("name")
             }
 
+    # A relationship requires BOTH sides' columns to end up with the SAME
+    # Power BI data type — Analysis Services either rejects the relationship
+    # outright or (worse, silently) fails to match any rows when they
+    # differ (e.g. one side ends up "string", the other "int64" for what is
+    # really the same Qlik field). The per-table `column_types` classifier
+    # above is an LLM call made independently PER TABLE — this project has
+    # already found that kind of independent-per-call LLM classification to
+    # be run-to-run INCONSISTENT for relationship cardinality (see
+    # infer_relationships.py's history); the same risk applies here to
+    # plain column TYPE, and a shared join-key field is exactly where it
+    # would silently break a relationship. Fix: for any field name shared
+    # across 2+ tables (a relationship candidate — the same grouping
+    # `infer_relationships.py` uses), compute its type ONCE, deterministically,
+    # from Qlik's own field tags (`_infer_column_type` — `$numeric`/
+    # `$integer`/`$date`/`$timestamp`, the Engine API's own per-field
+    # classification) and apply that SAME type to every table's copy of it,
+    # overriding the LLM's per-table guess entirely for these fields —
+    # never let two tables independently disagree on a shared key's type.
+    _field_occurrences: dict[str, list[tuple[str, dict]]] = {}
+    for rt in raw_data_model.get("tables", []):
+        rt_name_for_field = rt.get("qName") or rt.get("name") or ""
+        for f in rt.get("qFields", rt.get("fields", [])):
+            fname = f.get("qName") or f.get("name")
+            if fname:
+                _field_occurrences.setdefault(fname.casefold(), []).append((rt_name_for_field, f))
+    canonical_type_by_field_cf: dict[str, str] = {
+        field_cf: _infer_column_type(occurrences[0][1])
+        for field_cf, occurrences in _field_occurrences.items()
+        if len({t for t, _ in occurrences}) >= 2
+    }
+
     tables: dict[str, dict] = {}
     # A RESIDENT/GROUP BY calculated table's own DAX does RELATED(<value
     # table>[...]) while iterating <source table> — that REQUIRES <source
@@ -1812,8 +2264,20 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
         if not table_name:
             continue
         raw_fields = raw_table.get("qFields", raw_table.get("fields", []))
-
-        if _DISTRIBUTION_TABLE_NAME_RE.match(table_name):
+        field_names = [f.get("qName") or f.get("name") for f in raw_fields if f.get("qName") or f.get("name")]
+        # PRIMARY signal: any field on this table carries Qlik's own
+        # DL_DISTRIBUTION_SVC__ tag (a real `TAG FIELD ... with '...'`
+        # statement in the script — structural, not naming-convention
+        # guesswork). SECONDARY fallback: the table's own name still
+        # follows the DL_DISTRIBUTION... convention even if no tag was
+        # captured for it. Either signal alone is enough — see
+        # _DISTRIBUTION_TABLE_NAME_RE's own docstring for why relying on
+        # the name alone was a real generalization bug.
+        is_distribution_table = (
+            _DISTRIBUTION_TABLE_NAME_RE.match(table_name)
+            or any(f in distribution_tags for f in field_names)
+        )
+        if is_distribution_table:
             # Qlik's own in-application report-distribution/bursting
             # infrastructure (recipient list, groups, per-recipient
             # filters) — not business data, and out of scope for a
@@ -1825,7 +2289,6 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
             # silently lost — a person can map that onto whichever real
             # Power BI distribution mechanism (subscriptions, Power
             # Automate, RLS) the actual scope needs, if any.
-            field_names = [f.get("qName") or f.get("name") for f in raw_fields if f.get("qName") or f.get("name")]
             described = [f"{f} ({distribution_tags[f]})" if f in distribution_tags else f for f in field_names]
             print(f"[build] SKIPPED table '{table_name}': Qlik in-app report-distribution infrastructure "
                   f"(recipient/group/filter configuration for Qlik's own reporting feature), not business "
@@ -1870,6 +2333,20 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                 # computed directly here, rather than guessing "string".
                 dtype = _infer_column_type(f)
                 skipped_by_llm += 1
+            canonical_dtype = canonical_type_by_field_cf.get(fname.casefold())
+            if canonical_dtype is not None and canonical_dtype != dtype:
+                # This field also appears in at least one OTHER table — a
+                # relationship candidate — so its type must be decided ONCE,
+                # consistently, from Qlik's own field tags, never per-table
+                # by an independently-called LLM classification (see the
+                # canonical_type_by_field_cf computation above for why: a
+                # relationship whose two sides end up with different Power
+                # BI column types either gets rejected outright or silently
+                # matches zero rows).
+                print(f"[build] {table_name}[{fname}]: forcing type '{canonical_dtype}' (this field also "
+                      f"appears in another table — a relationship key must have the SAME type on both "
+                      f"sides; per-table classification said '{dtype}')")
+                dtype = canonical_dtype
             if (dtype in ("int64", "double") and "month" in fname.casefold()
                     and fname.casefold() not in month_derived):
                 # A field whose NAME is specifically about a month (not
@@ -1911,10 +2388,11 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
         column_names_here = {c["name"] for c in columns}
         table_chr_concat = chr_concat_by_table.get(table_name, {})
         table_dual_key = dual_key_by_table.get(table_name, {})
+        table_hash_key = hash_key_by_table.get(table_name, {})
         table_applymap = applymap_by_table.get(table_name, {})
 
         def _spec_sources_present(spec: dict) -> bool:
-            if spec["func"] == "ConcatKey":
+            if spec["func"] in ("ConcatKey", "HashKey"):
                 # field_a/field_b are trusted from the regex match against
                 # the script itself, NOT required to already be in this
                 # table's own declared columns — Qlik can (and here does)
@@ -1949,6 +2427,7 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                 month_derived.get(c["name"].casefold())
                 or table_chr_concat.get(c["name"].casefold())
                 or table_dual_key.get(c["name"].casefold())
+                or table_hash_key.get(c["name"].casefold())
                 or table_applymap.get(c["name"].casefold())
             )
             if spec and _spec_sources_present(spec):
@@ -1959,12 +2438,25 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                     return f'Chr({s["code"]}) & {s["source"]}' if s["prefix"] else f'{s["source"]} & Chr({s["code"]})'
                 if s["func"] == "ApplyMapSubfield":
                     return f'SubField(ApplyMap(\'{s["map_name"]}\', {s["source"]}, \'{s["default"]}\'), \'{s["sep"]}\', {s["part_index"] + 1})'
+                if s["func"] == "HashKey":
+                    return f'AutoNumberHash128({", ".join(s["fields"])})'
                 if s["func"] == "ConcatKey":
                     return f'{s["field_a"]} & "{s["sep"]}" & {s["field_b"]}'
                 return f"{s['func']}({s['source']})"
             names = ", ".join(f"{n} = {_describe(s)}" for n, s in computed.items())
             print(f"[build] {table_name}: computing {names} in Power Query (per the Qlik LOAD script) "
                   f"instead of reading them from the CSV — they were never in the source file either")
+            # AutoNumberHash128/256 is a genuinely NUMERIC key in Qlik, and
+            # csv_m.py's shared `fnHashKey` M function (see _computed_column_expr's
+            # "HashKey" case) now reproduces that — a real 32-bit numeric
+            # hash, not a text concatenation — so every HashKey computed
+            # column's model type must be int64 too, regardless of whatever
+            # the LLM's column-type classification guessed for it (it has no
+            # way to know this field is 100% computed, never read from a
+            # source file, so its guess here is never authoritative).
+            for col in columns:
+                if computed.get(col["name"], {}).get("func") == "HashKey":
+                    col["data_type"] = "int64"
 
         # A field Qlik's own script renames (`RiskBand AS PredictedRiskBand`)
         # is genuinely absent from a raw source file under its NEW name — the
@@ -2016,6 +2508,59 @@ def _assemble_semantic_inputs(extracted_dir: str, converted_dir: str):
                 "m_expression": generate_inline_partition_m(columns, inline_tables[table_name]),
                 "computed": {}, "renames": {}, "multi_source_files": None, "csv_filename": None,
                 "inline_rows": inline_tables[table_name],
+            }
+            continue
+
+        link_spec = link_table_specs_by_table.get(table_name)
+        if link_spec:
+            # The Qlik "link-table pattern" — this table has no file/FROM
+            # source of its own at all, it's built entirely by unioning rows
+            # already loaded into OTHER tables (see _detect_link_table_specs).
+            # Reference each source table's OWN already-generated M query
+            # (Power Query resolves cross-query references by name and
+            # figures out refresh order itself, same as Qlik's own RESIDENT
+            # does against an already-loaded table) instead of expecting a
+            # "{table}.csv" that was never going to exist.
+            print(f"[build] {table_name}: built in the Qlik script purely by CONCATENATE-ing "
+                  f"{', '.join(link_spec['sources'])} (RESIDENT, no FROM of its own) — combining those "
+                  f"{len(link_spec['sources'])} already-generated queries (Table.Combine) instead of "
+                  f"expecting its own source file" +
+                  (f"; then Table.Distinct + {', '.join(k['name'] for k in link_spec['post_distinct_hash_keys'])} "
+                   f"per the script's NoConcatenate/LOAD DISTINCT dedup+rekey step"
+                   if link_spec["distinct"] else ""))
+            # Same int64 override as the plain HashKey `computed` case above
+            # — these columns are the shared `fnHashKey` numeric hash too,
+            # not text, regardless of the LLM's column-type guess.
+            _hash_names = {k["name"] for k in link_spec.get("pre_distinct_hash_keys", [])} | \
+                {k["name"] for k in link_spec.get("post_distinct_hash_keys", [])}
+            for col in columns:
+                if col["name"] in _hash_names:
+                    col["data_type"] = "int64"
+            tables[table_name] = {
+                "columns": columns,
+                "m_expression": generate_concat_chain_partition_m(link_spec),
+                "computed": {}, "renames": {}, "multi_source_files": None, "csv_filename": None,
+                "link_table_spec": link_spec,
+            }
+            continue
+
+        resident_join_spec = resident_join_specs_by_table.get(table_name)
+        if resident_join_spec:
+            # A Resident scratch table + one or more plain `left join(...)
+            # Resident Other` blocks, collapsed via `LOAD DISTINCT` into a
+            # brand-new table with a single computed &-concatenation column
+            # (see _detect_resident_join_rename_specs) — no FROM/file of its
+            # own anywhere in the script either.
+            join_desc = ", ".join(j["source"] for j in resident_join_spec["joins"])
+            print(f"[build] {table_name}: built in the Qlik script from {resident_join_spec['base_source']}"
+                  f"{' left-joined with ' + join_desc if join_desc else ''} (RESIDENT, no FROM of its own) — "
+                  f"reproducing the join + computed '{resident_join_spec['output_column']}' concatenation "
+                  f"instead of expecting its own source file")
+            tables[table_name] = {
+                "columns": columns,
+                "m_expression": generate_resident_join_concat_partition_m(resident_join_spec),
+                "computed": {}, "renames": {}, "multi_source_files": None, "csv_filename": None,
+                "resident_join_spec": resident_join_spec,
             }
             continue
 
@@ -2713,6 +3258,83 @@ def _fix_phantom_table_refs(
                 c["expression"] = fix("calculated column", c["name"], c["expression"])
 
 
+# A bare bracket reference `[Name]` — NOT preceded by a word character or a
+# closing quote, which would make it the `Table[Col]`/`'Table'[Col]` form
+# `_TABLE_QUALIFIED_REF_RE` already handles — is only valid DAX when `Name`
+# resolves to a real measure (any expression) or, in a calculated column's
+# own expression specifically, a real column on that SAME table (row
+# context). Anything else is a reference to nothing.
+_BARE_BRACKET_REF_RE = re.compile(r"(?<![\w'])\[([^\[\]]+)\]")
+
+
+def _fix_unresolved_bare_bracket_refs(
+    measures_by_table: dict[str, list[dict]],
+    calc_cols_by_table: dict[str, list[dict]],
+    tables: dict[str, dict],
+) -> None:
+    """Confirmed, real bug (user report, 2026-09-23, Control_Tower_v2): the
+    set-analysis-to-CALCULATE conversion emitted `CALCULATE(AVERAGE(...),
+    [vCurrMonthSet])` as a "placeholder filter" for a Qlik variable
+    (`{<$(vCurrMonthSet)>}`) it couldn't resolve — the conversion's own
+    `adhoc_expressions.converted.json` admits as much ("assumes variable
+    resolves to a valid CALCULATE filter"). `vCurrMonthSet` was never
+    created as a measure anywhere, so DAX can't resolve the bare bracket
+    reference at all ("The value for 'vCurrMonthSet' cannot be determined.
+    Either the column doesn't exist, or there is no current row for this
+    column.") — and because Analysis Services processes/recalculates
+    measures transactionally across the WHOLE refresh batch, one such
+    broken measure fails every other table's refresh too ("Load was
+    cancelled by an error in loading a previous table"), even tables with
+    no relation to the broken measure at all.
+
+    `_fix_phantom_table_refs` right above already defends the
+    `Table[Col]`-qualified case (`Foo[Foo]` where `Foo` isn't a real
+    table); this is the sibling defense for the UNQUALIFIED case — a bare
+    `[Name]` that isn't a real measure (or, for a calculated column, isn't
+    a real column on that same table either). Same fallback as that
+    function: replace the whole expression with BLANK() and warn loudly
+    rather than ship a measure that poisons the entire refresh
+    transaction."""
+    measure_names: dict[str, str] = {}
+    for ms in measures_by_table.values():
+        for m in ms:
+            measure_names.setdefault(m["name"].casefold(), m["name"])
+
+    def fix(kind: str, name: str, expr: str, own_columns: set[str]) -> str:
+        unresolved: list[str] = []
+
+        def repl(match: re.Match) -> str:
+            ref = match.group(1).strip()
+            if ref.casefold() in measure_names or ref.casefold() in own_columns:
+                return match.group(0)
+            unresolved.append(ref)
+            return match.group(0)
+
+        _BARE_BRACKET_REF_RE.sub(repl, expr)
+        if unresolved:
+            print(f"[build] WARNING: {kind} '{name}' references [{', '.join(sorted(set(unresolved)))}] "
+                  f"— not a real measure (or, for a calculated column, a column on its own table) anywhere "
+                  f"in the model. This is very likely an LLM-invented placeholder for a Qlik variable it "
+                  f"couldn't resolve (e.g. a set-analysis modifier like {{<$(vSomeVar)>}}) — left in place, "
+                  f"this breaks not just this object but the WHOLE refresh transaction. Replaced its "
+                  f"expression with BLANK(); resolve the source variable's real filter logic by hand if "
+                  f"needed.")
+            return "BLANK()"
+        return expr
+
+    for table_name, ms in measures_by_table.items():
+        for m in ms:
+            if m.get("expression"):
+                own_cols = {c["name"].casefold() for c in tables.get(table_name, {}).get("columns", [])}
+                m["expression"] = fix("measure", m["name"], m["expression"], own_cols)
+    for table_name, cols in calc_cols_by_table.items():
+        own_cols = {c["name"].casefold() for c in tables.get(table_name, {}).get("columns", [])}
+        own_cols |= {c["name"].casefold() for c in cols}
+        for c in cols:
+            if c.get("expression"):
+                c["expression"] = fix("calculated column", c["name"], c["expression"], own_cols)
+
+
 def _dedupe_measure_names(measures_by_table: dict[str, list[dict]]) -> dict[tuple[str, str], str]:
     """DAX measure names must be unique across the whole model, unlike Qlik
     master measures which only need to be unique per-visual — and Tabular
@@ -3024,6 +3646,26 @@ def _apply_variable_scenarios(
                   f"({', '.join(str(v) for v in values)}) with a Slicer bound to '{table_name}[Value]'")
 
 
+_TRIVIAL_CONSTANT_MEASURE_RE = re.compile(
+    r"^=?\s*(?:sum|count|avg|min|max)\s*\(\s*-?\d+(?:\.\d+)?\s*\)\s*$", re.IGNORECASE
+)
+
+
+def _is_trivial_constant_measure(*texts: str | None) -> bool:
+    """A Qlik chart-expression idiom (`=Sum(5)`, `=Sum(4)`, ...) that wraps
+    a bare NUMBER literal in an aggregation function with no field
+    reference at all — real, confirmed use case: a dummy dimension/measure
+    pair used purely to plot a fixed reference line/marker position on a
+    combo chart's Y-axis, never a genuine data-driven measure. Real
+    business data never legitimately needs `Sum` of a constant (a plain
+    number the LLM/conversion should have already just emitted as a
+    literal, not wrapped in an aggregation) — checked against BOTH the raw
+    Qlik source text and the item's own `name` (report_visuals commonly
+    uses the raw expression itself as the name when the chart gave it no
+    real label, e.g. `name: "=Sum(5)"`)."""
+    return any(t and _TRIVIAL_CONSTANT_MEASURE_RE.match(t.strip()) for t in texts)
+
+
 def _apply_adhoc_expressions(
     converted_dir: str,
     tables: dict[str, dict],
@@ -3050,6 +3692,10 @@ def _apply_adhoc_expressions(
         table, name, expr = m.get("table"), m.get("name"), m.get("expression")
         if not (table and name and expr and table in tables):
             continue
+        if _is_trivial_constant_measure(name, m.get("qlik_source")):
+            print(f"[build] {table}: dropping trivial constant measure '{name}' (a bare-number "
+                  f"aggregation like Sum(5) — a Qlik dummy reference-line marker, not real data)")
+            continue
         measures_by_table.setdefault(table, []).append({
             "name": name, "expression": expr,
             "format_string": m.get("format_string"), "is_hidden": m.get("is_hidden", False),
@@ -3061,6 +3707,10 @@ def _apply_adhoc_expressions(
     for item in data.get("items", []):
         table, name = item.get("table"), item.get("name")
         if not (table and name and table in tables):
+            continue
+        if _is_trivial_constant_measure(name, item.get("qlik_source")):
+            print(f"[build] {table}: dropping trivial constant {item.get('type', 'item')} '{name}' (a bare-number "
+                  f"aggregation like Sum(5) — a Qlik dummy reference-line marker, not real data)")
             continue
         if item.get("type") == "calculated_column" and item.get("expression"):
             calc_cols_by_table.setdefault(table, []).append({"name": name, "expression": item["expression"]})
@@ -3143,51 +3793,29 @@ _PLACEHOLDER_CONST_RE = re.compile(
 )
 
 
-def _collect_measure_properties(node, out: set[str]) -> None:
-    """Every `Measure`/`Column` Property name referenced anywhere inside one
-    visual — Property may already be hoisted to its canonical sibling
-    position or still nested in Expression (this runs before
-    _normalize_field_node_shapes), so check both."""
-    if isinstance(node, dict):
-        for key in ("Measure", "Column"):
-            inner = node.get(key)
-            if isinstance(inner, dict):
-                prop = inner.get("Property") or inner.get("Expression", {}).get("Property")
-                if prop:
-                    out.add(prop)
-        for v in node.values():
-            _collect_measure_properties(v, out)
-    elif isinstance(node, list):
-        for v in node:
-            _collect_measure_properties(v, out)
-
-
-def _synthesize_placeholder_constant_measures(
-    pages: list[dict],
-    tables: dict[str, dict],
-    measures_by_table: dict[str, list[dict]],
-    original_measure_table: dict[str, tuple[str, str]],
-) -> None:
-    fallback_table = next((t for t in tables if not tables[t].get("is_calculated")), "")
-    if not fallback_table:
-        return
+def _drop_placeholder_constant_kpis(pages: list[dict]) -> None:
+    """Remove any visual whose entire content is a hard-coded Qlik constant
+    (`=Sum(5)`-style placeholder/target tile — see _PLACEHOLDER_CONST_RE),
+    per explicit user instruction not to build these at all. Mutates
+    `pages` in place. Sibling of `_is_trivial_constant_measure` (same
+    underlying Qlik idiom, different entry point: that one catches it as an
+    ad-hoc chart EXPRESSION, this one catches it via report_visuals' own
+    "notes" on a visual it already recognized as a placeholder)."""
+    dropped = 0
     for page in pages:
-        for visual in page.get("visuals", []):
+        visuals = page.get("visuals", [])
+        kept = []
+        for visual in visuals:
             m = _PLACEHOLDER_CONST_RE.search(visual.get("notes", ""))
-            if not m:
+            if m:
+                dropped += 1
                 continue
-            value = m.group(1) or m.group(2)
-            props: set[str] = set()
-            _collect_measure_properties(visual, props)
-            for prop in props:
-                if prop.casefold() in original_measure_table:
-                    continue
-                measures_by_table.setdefault(fallback_table, []).append({
-                    "name": prop, "expression": value, "is_hidden": True,
-                })
-                original_measure_table[prop.casefold()] = (fallback_table, prop)
-                print(f"[build] synthesized constant measure '{prop}' = {value} "
-                      f"(Qlik KPI was a hard-coded Sum({value}) placeholder, per report_visuals' own notes)")
+            kept.append(visual)
+        page["visuals"] = kept
+    if dropped:
+        print(f"[build] dropped {dropped} KPI tile(s) whose entire content was a hard-coded constant "
+              f"(=Sum(N)-style placeholder/target tile, per report_visuals' own notes) — not real data, "
+              f"not built")
 
 
 def _normalize_label(s: str) -> str:
@@ -3861,6 +4489,19 @@ def _replace_system_field_visuals(pages: list[dict]) -> None:
             }
 
 
+def _textbox_has_real_text(visual: dict) -> bool:
+    """True only if a `textbox` visual's `general.properties.paragraphs`
+    contains at least one non-whitespace `textRuns[].value` — used to drop
+    a blank/note-only textbox (see _load_pages) rather than ship it as
+    unwanted clutter on the report."""
+    for obj in (visual.get("objects") or {}).get("general", []):
+        for para in (obj.get("properties") or {}).get("paragraphs", []):
+            for run in para.get("textRuns", []):
+                if (run.get("value") or "").strip():
+                    return True
+    return False
+
+
 def _load_pages(converted_dir: str) -> list[dict]:
     pages = []
     for path in sorted(glob.glob(os.path.join(converted_dir, "page__*.json"))):
@@ -3879,7 +4520,50 @@ def _load_pages(converted_dir: str) -> list[dict]:
                   f"{len(visuals) - len(good_visuals)} malformed (non-object) visual entr"
                   f"{'y' if len(visuals) - len(good_visuals) == 1 else 'ies'} on disk — dropping "
                   f"rather than crashing the build; re-run convert for this app to regenerate cleanly")
-            page["visuals"] = good_visuals
+        # Same defense-in-depth as modules/sheet/visuals.py's own filter
+        # (which prevents this going forward) — this ALSO catches it for
+        # converted/ files already on disk from before that fix existed. A
+        # real, confirmed case: the LLM truncated a batch response with
+        # {"name": "... (additional KPI and button visuals omitted for
+        # brevity) ..."} instead of fully enumerating every visual — no
+        # "visual" key at all, which reached the PBIR writer as an empty
+        # visual missing the REQUIRED visualType property ("Required
+        # property 'visualType' was not included in the /visual
+        # property"), rejecting the whole report on open.
+        complete_visuals = [
+            v for v in good_visuals
+            if isinstance(v.get("visual"), dict) and v["visual"].get("visualType")
+        ]
+        if len(complete_visuals) != len(good_visuals):
+            dropped = len(good_visuals) - len(complete_visuals)
+            print(f"[build] WARNING: {os.path.basename(path)} has {dropped} visual entr"
+                  f"{'y' if dropped == 1 else 'ies'} with no real 'visual'/'visualType' content on disk "
+                  f"(likely an LLM truncation placeholder) — dropping rather than shipping an incomplete "
+                  f"visual that would reject the whole report on open")
+        # Buttons and blank/note-only textboxes are unwanted clutter, not a
+        # useful stand-in for an unsupported Qlik object (see
+        # sheets_convert.skill.md's "button"/blank-textbox rules — the LLM
+        # is now told not to emit these going forward, but a converted/ page
+        # JSON already on disk from before that rule existed can still have
+        # them). Drop both here as well so a plain rebuild (no re-run of the
+        # expensive LLM conversion step) is enough to clear them from the
+        # report.
+        kept_visuals = []
+        dropped_buttons = dropped_blank_textboxes = 0
+        for v in complete_visuals:
+            vtype = v["visual"].get("visualType")
+            if vtype == "actionButton":
+                dropped_buttons += 1
+                continue
+            if vtype == "textbox" and not _textbox_has_real_text(v["visual"]):
+                dropped_blank_textboxes += 1
+                continue
+            kept_visuals.append(v)
+        if dropped_buttons or dropped_blank_textboxes:
+            print(f"[build] {os.path.basename(path)}: dropping {dropped_buttons} button visual(s) and "
+                  f"{dropped_blank_textboxes} blank/note-only textbox visual(s) — not reproduced by this "
+                  f"pipeline (unwanted clutter on the report)")
+        page["visuals"] = kept_visuals
         pages.append(page)
     _normalize_query_states(pages)
     return pages
